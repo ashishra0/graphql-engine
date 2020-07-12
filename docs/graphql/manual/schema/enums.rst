@@ -1,3 +1,9 @@
+.. meta::
+   :description: Use enums in Hasura
+   :keywords: hasura, docs, schema, enum
+
+.. _enums:
+
 Enum type fields
 ================
 
@@ -5,6 +11,9 @@ Enum type fields
   :backlinks: none
   :depth: 2
   :local:
+
+Introduction
+------------
 
 Enum type fields are restricted to a fixed set of allowed values.
 
@@ -94,7 +103,7 @@ the following restrictions:
    <https://graphql.github.io/graphql-spec/June2018/#EnumValue>`__.
 2. Optionally, the table may have a second column, also of type ``text``, which will be used as a description of each
    value in the generated GraphQL schema.
-3. The table may not contain any other columns.
+3. The table must not contain any other columns.
 4. The table must contain at least 1 row.
 
 **For example**, to create an enum that represents our user roles, we would create the following table:
@@ -138,7 +147,7 @@ we need to tell Hasura that this table represents an enum.
     Head to the ``Modify`` tab of the table and toggle the switch in the
     ``Set table as enum`` section:
 
-    .. thumbnail:: ../../../img/graphql/manual/schema/enum-set.png
+    .. thumbnail:: /img/graphql/manual/schema/enum-set.png
        :alt: Set table as enum
 
   .. tab:: API
@@ -233,7 +242,7 @@ This can be achieved via the console by performing the following steps while set
 2. Use the ``RawSQL`` tab of the console to insert the enum values into the table and mark the insert as a migration
 3. Set the table as an enum
 
-You can also :doc:`manually create migration files <../migrations/advanced/writing-migrations-manually>` to achieve
+You can also :ref:`manually create migration files <manual_migrations>` to achieve
 this.
 
 Current limitations

@@ -11,6 +11,7 @@ module Hasura.RQL.DDL.Metadata.Types
   , tmObjectRelationships
   , tmArrayRelationships
   , tmComputedFields
+  , tmRemoteRelationships
   , tmInsertPermissions
   , tmSelectPermissions
   , tmUpdatePermissions
@@ -19,7 +20,10 @@ module Hasura.RQL.DDL.Metadata.Types
   , mkTableMeta
   , ReplaceMetadata(..)
   , replaceMetadataToOrdJSON
+  , ActionMetadata(..)
+  , ActionPermissionMetadata(..)
   , ComputedFieldMeta(..)
+  , RemoteRelationshipMeta(..)
   , FunctionsMetadata(..)
   , ExportMetadata(..)
   , ClearMetadata(..)
@@ -31,24 +35,26 @@ module Hasura.RQL.DDL.Metadata.Types
 
 import           Hasura.Prelude
 
-import           Control.Lens                   hiding (set, (.=))
+import           Control.Lens                        hiding (set, (.=))
 import           Data.Aeson
 import           Data.Aeson.Casing
 import           Data.Aeson.TH
-import           Language.Haskell.TH.Syntax     (Lift)
+import           Language.Haskell.TH.Syntax          (Lift)
 
-import qualified Data.Aeson.Ordered             as AO
-import qualified Data.HashMap.Strict            as HM
-import qualified Data.HashSet                   as HS
+import qualified Data.Aeson.Ordered                  as AO
+import qualified Data.HashMap.Strict                 as HM
+import qualified Data.HashSet                        as HS
+import qualified Language.GraphQL.Draft.Syntax       as G
 
 import           Hasura.RQL.Types
 import           Hasura.SQL.Types
 
-import qualified Hasura.RQL.DDL.ComputedField   as ComputedField
-import qualified Hasura.RQL.DDL.Permission      as Permission
-import qualified Hasura.RQL.DDL.QueryCollection as Collection
-import qualified Hasura.RQL.DDL.Relationship    as Relationship
-import qualified Hasura.RQL.DDL.Schema          as Schema
+import qualified Hasura.RQL.DDL.ComputedField        as ComputedField
+import qualified Hasura.RQL.DDL.Permission           as Permission
+import qualified Hasura.RQL.DDL.QueryCollection      as Collection
+import qualified Hasura.RQL.DDL.Relationship         as Relationship
+import qualified Hasura.RQL.DDL.Schema               as Schema
+import qualified Hasura.RQL.Types.RemoteRelationship as RemoteRelationship
 
 data MetadataVersion
   = MVVersion1
@@ -78,6 +84,13 @@ data ComputedFieldMeta
   } deriving (Show, Eq, Lift, Generic)
 $(deriveJSON (aesonDrop 4 snakeCase) ''ComputedFieldMeta)
 
+data RemoteRelationshipMeta
+  = RemoteRelationshipMeta
+  { _rrmName       :: !RemoteRelationshipName
+  , _rrmDefinition :: !RemoteRelationship.RemoteRelationshipDef
+  } deriving (Show, Eq, Lift, Generic)
+$(deriveJSON (aesonDrop 4 snakeCase) ''RemoteRelationshipMeta)
+
 data TableMeta
   = TableMeta
   { _tmTable               :: !QualifiedTable
@@ -86,6 +99,7 @@ data TableMeta
   , _tmObjectRelationships :: ![Relationship.ObjRelDef]
   , _tmArrayRelationships  :: ![Relationship.ArrRelDef]
   , _tmComputedFields      :: ![ComputedFieldMeta]
+  , _tmRemoteRelationships :: ![RemoteRelationshipMeta]
   , _tmInsertPermissions   :: ![Permission.InsPermDef]
   , _tmSelectPermissions   :: ![Permission.SelPermDef]
   , _tmUpdatePermissions   :: ![Permission.UpdPermDef]
@@ -96,7 +110,7 @@ $(makeLenses ''TableMeta)
 
 mkTableMeta :: QualifiedTable -> Bool -> TableConfig -> TableMeta
 mkTableMeta qt isEnum config =
-  TableMeta qt isEnum config [] [] [] [] [] [] [] []
+  TableMeta qt isEnum config [] [] [] [] [] [] [] [] []
 
 instance FromJSON TableMeta where
   parseJSON (Object o) = do
@@ -111,6 +125,7 @@ instance FromJSON TableMeta where
      <*> o .:? orKey .!= []
      <*> o .:? arKey .!= []
      <*> o .:? cfKey .!= []
+     <*> o .:? rrKey .!= []
      <*> o .:? ipKey .!= []
      <*> o .:? spKey .!= []
      <*> o .:? upKey .!= []
@@ -129,6 +144,7 @@ instance FromJSON TableMeta where
       dpKey = "delete_permissions"
       etKey = "event_triggers"
       cfKey = "computed_fields"
+      rrKey = "remote_relationships"
 
       unexpectedKeys =
         HS.fromList (HM.keys o) `HS.difference` expectedKeySet
@@ -136,7 +152,7 @@ instance FromJSON TableMeta where
       expectedKeySet =
         HS.fromList [ tableKey, isEnumKey, configKey, orKey
                     , arKey , ipKey, spKey, upKey, dpKey, etKey
-                    , cfKey
+                    , cfKey, rrKey
                     ]
 
   parseJSON _ =
@@ -161,13 +177,16 @@ instance FromJSON ClearMetadata where
 
 data ReplaceMetadata
   = ReplaceMetadata
-  { aqVersion          :: !MetadataVersion
-  , aqTables           :: ![TableMeta]
-  , aqFunctions        :: !FunctionsMetadata
-  , aqRemoteSchemas    :: ![AddRemoteSchemaQuery]
-  , aqQueryCollections :: ![Collection.CreateCollection]
-  , aqAllowlist        :: ![Collection.CollectionReq]
-  } deriving (Show, Eq, Lift)
+  { aqVersion           :: !MetadataVersion
+  , aqTables            :: ![TableMeta]
+  , aqFunctions         :: !FunctionsMetadata
+  , aqRemoteSchemas     :: ![AddRemoteSchemaQuery]
+  , aqQueryCollections  :: ![Collection.CreateCollection]
+  , aqAllowlist         :: ![Collection.CollectionReq]
+  , aqCustomTypes       :: !CustomTypes
+  , aqActions           :: ![ActionMetadata]
+  , aqCronTriggers      :: ![CronTriggerMetadata]
+  } deriving (Show, Eq)
 
 instance FromJSON ReplaceMetadata where
   parseJSON = withObject "Object" $ \o -> do
@@ -177,7 +196,10 @@ instance FromJSON ReplaceMetadata where
       <*> (o .:? "functions" >>= parseFunctions version)
       <*> o .:? "remote_schemas" .!= []
       <*> o .:? "query_collections" .!= []
-      <*> o .:? "allow_list" .!= []
+      <*> o .:? "allowlist" .!= []
+      <*> o .:? "custom_types" .!= emptyCustomTypes
+      <*> o .:? "actions" .!= []
+      <*> o .:? "cron_triggers" .!= []
     where
       parseFunctions version maybeValue =
         case version of
@@ -192,13 +214,16 @@ $(deriveToJSON defaultOptions ''ExportMetadata)
 instance FromJSON ExportMetadata where
   parseJSON _ = return ExportMetadata
 
-data ReloadMetadata
+newtype ReloadMetadata
   = ReloadMetadata
+  { _rmReloadRemoteSchemas :: Bool}
   deriving (Show, Eq, Lift)
-$(deriveToJSON defaultOptions ''ReloadMetadata)
+$(deriveToJSON (aesonDrop 3 snakeCase) ''ReloadMetadata)
 
 instance FromJSON ReloadMetadata where
-  parseJSON _ = return ReloadMetadata
+  parseJSON = \case
+    Object o -> ReloadMetadata <$> o .:? "reload_remote_schemas" .!= False
+    _        -> pure $ ReloadMetadata False
 
 data DumpInternalState
   = DumpInternalState
@@ -240,11 +265,17 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
                                remoteSchemas
                                queryCollections
                                allowlist
+                               customTypes
+                               actions
+                               cronTriggers
                              ) = AO.object $ [versionPair, tablesPair] <>
                                  catMaybes [ functionsPair
                                            , remoteSchemasPair
                                            , queryCollectionsPair
                                            , allowlistPair
+                                           , actionsPair
+                                           , customTypesPair
+                                           , cronTriggersPair
                                            ]
   where
     versionPair = ("version", AO.toOrdered version)
@@ -256,6 +287,11 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
     queryCollectionsPair = listToMaybeOrdPair "query_collections" createCollectionToOrdJSON queryCollections
 
     allowlistPair = listToMaybeOrdPair "allowlist" AO.toOrdered allowlist
+    customTypesPair = if customTypes == emptyCustomTypes then Nothing
+                      else Just ("custom_types", customTypesToOrdJSON customTypes)
+    actionsPair = listToMaybeOrdPair "actions" actionMetadataToOrdJSON actions
+
+    cronTriggersPair = listToMaybeOrdPair "cron_triggers" crontriggerQToOrdJSON cronTriggers
 
     tableMetaToOrdJSON :: TableMeta -> AO.Value
     tableMetaToOrdJSON ( TableMeta
@@ -265,6 +301,7 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
                          objectRelationships
                          arrayRelationships
                          computedFields
+                         remoteRelationships
                          insertPermissions
                          selectPermissions
                          updatePermissions
@@ -276,6 +313,7 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
                                         , objectRelationshipsPair
                                         , arrayRelationshipsPair
                                         , computedFieldsPair
+                                        , remoteRelationshipsPair
                                         , insertPermissionsPair
                                         , selectPermissionsPair
                                         , updatePermissionsPair
@@ -292,6 +330,8 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
                                  relDefToOrdJSON arrayRelationships
         computedFieldsPair = listToMaybeOrdPair "computed_fields"
                              computedFieldMetaToOrdJSON computedFields
+        remoteRelationshipsPair = listToMaybeOrdPair "remote_relationships"
+                                  AO.toOrdered remoteRelationships
         insertPermissionsPair = listToMaybeOrdPair "insert_permissions"
                                 insPermDefToOrdJSON insertPermissions
         selectPermissionsPair = listToMaybeOrdPair "select_permissions"
@@ -318,10 +358,11 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
         insPermDefToOrdJSON :: Permission.InsPermDef -> AO.Value
         insPermDefToOrdJSON = permDefToOrdJSON insPermToOrdJSON
           where
-            insPermToOrdJSON (Permission.InsPerm check set columns) =
+            insPermToOrdJSON (Permission.InsPerm check set columns mBackendOnly) =
               let columnsPair = ("columns",) . AO.toOrdered <$> columns
+                  backendOnlyPair = ("backend_only",) . AO.toOrdered <$> mBackendOnly
               in AO.object $ [("check", AO.toOrdered check)]
-                 <> catMaybes [maybeSetToMaybeOrdPair set, columnsPair]
+                 <> catMaybes [maybeSetToMaybeOrdPair set, columnsPair, backendOnlyPair]
 
         selPermDefToOrdJSON :: Permission.SelPermDef -> AO.Value
         selPermDefToOrdJSON = permDefToOrdJSON selPermToOrdJSON
@@ -345,9 +386,10 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
         updPermDefToOrdJSON :: Permission.UpdPermDef -> AO.Value
         updPermDefToOrdJSON = permDefToOrdJSON updPermToOrdJSON
           where
-            updPermToOrdJSON (Permission.UpdPerm columns set fltr) =
+            updPermToOrdJSON (Permission.UpdPerm columns set fltr check) =
               AO.object $ [ ("columns", AO.toOrdered columns)
                           , ("filter", AO.toOrdered fltr)
+                          , ("check", AO.toOrdered check)
                           ] <> catMaybes [maybeSetToMaybeOrdPair set]
 
         delPermDefToOrdJSON :: Permission.DelPermDef -> AO.Value
@@ -403,6 +445,116 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
                   , ("definition", AO.toOrdered definition)
                   ] <> catMaybes [maybeCommentToMaybeOrdPair comment]
 
+    crontriggerQToOrdJSON :: CronTriggerMetadata -> AO.Value
+    crontriggerQToOrdJSON
+      (CronTriggerMetadata name webhook schedule payload retryConf headers includeInMetadata comment) =
+      AO.object $
+            [ ("name", AO.toOrdered name)
+            , ("webhook", AO.toOrdered webhook)
+            , ("schedule", AO.toOrdered schedule)
+            , ("include_in_metadata", AO.toOrdered includeInMetadata)
+            ]
+            <> catMaybes
+            [ maybeAnyToMaybeOrdPair "payload" AO.toOrdered payload
+            , maybeAnyToMaybeOrdPair "retry_conf" AO.toOrdered (maybeRetryConfiguration retryConf)
+            , maybeAnyToMaybeOrdPair "headers" AO.toOrdered (maybeHeader headers)
+            , maybeAnyToMaybeOrdPair "comment" AO.toOrdered comment]
+      where
+        maybeRetryConfiguration retryConfig
+          | retryConfig == defaultSTRetryConf = Nothing
+          | otherwise = Just retryConfig
+
+        maybeHeader headerConfig
+          | headerConfig == [] = Nothing
+          | otherwise = Just headerConfig
+
+    customTypesToOrdJSON :: CustomTypes -> AO.Value
+    customTypesToOrdJSON (CustomTypes inpObjs objs scalars enums) =
+      AO.object . catMaybes $ [ listToMaybeOrdPair "input_objects" inputObjectToOrdJSON =<< inpObjs
+                              , listToMaybeOrdPair "objects" objectTypeToOrdJSON =<< objs
+                              , listToMaybeOrdPair "scalars" scalarTypeToOrdJSON =<< scalars
+                              , listToMaybeOrdPair "enums" enumTypeToOrdJSON =<< enums
+                              ]
+      where
+        inputObjectToOrdJSON :: InputObjectTypeDefinition -> AO.Value
+        inputObjectToOrdJSON (InputObjectTypeDefinition tyName descM fields) =
+          AO.object $ [ ("name", AO.toOrdered tyName)
+                      , ("fields", AO.array $ map fieldDefinitionToOrdJSON $ toList fields)
+                      ]
+          <> catMaybes [maybeDescriptionToMaybeOrdPair descM]
+          where
+            fieldDefinitionToOrdJSON :: InputObjectFieldDefinition -> AO.Value
+            fieldDefinitionToOrdJSON (InputObjectFieldDefinition fieldName fieldDescM ty) =
+              AO.object $ [ ("name", AO.toOrdered fieldName)
+                          , ("type", AO.toOrdered ty)
+                          ]
+              <> catMaybes [maybeDescriptionToMaybeOrdPair fieldDescM]
+
+        objectTypeToOrdJSON :: ObjectTypeDefinition -> AO.Value
+        objectTypeToOrdJSON (ObjectTypeDefinition tyName descM fields rels) =
+          AO.object $ [ ("name", AO.toOrdered tyName)
+                      , ("fields", AO.array $ map fieldDefinitionToOrdJSON $ toList fields)
+                      ]
+          <> catMaybes [ maybeDescriptionToMaybeOrdPair descM
+                       , listToMaybeOrdPair "relationships" AO.toOrdered =<< rels
+                       ]
+          where
+            fieldDefinitionToOrdJSON :: ObjectFieldDefinition -> AO.Value
+            fieldDefinitionToOrdJSON (ObjectFieldDefinition fieldName argsValM fieldDescM ty) =
+              AO.object $ [ ("name", AO.toOrdered fieldName)
+                          , ("type", AO.toOrdered ty)
+                          ]
+              <> catMaybes [ (("arguments", ) . AO.toOrdered) <$> argsValM
+                           , maybeDescriptionToMaybeOrdPair fieldDescM
+                           ]
+
+        scalarTypeToOrdJSON :: ScalarTypeDefinition -> AO.Value
+        scalarTypeToOrdJSON (ScalarTypeDefinition tyName descM) =
+          AO.object $ [("name", AO.toOrdered tyName)]
+          <> catMaybes [maybeDescriptionToMaybeOrdPair descM]
+
+        enumTypeToOrdJSON :: EnumTypeDefinition -> AO.Value
+        enumTypeToOrdJSON (EnumTypeDefinition tyName descM values) =
+          AO.object $ [ ("name", AO.toOrdered tyName)
+                      , ("values", AO.toOrdered values)
+                      ]
+          <> catMaybes [maybeDescriptionToMaybeOrdPair descM]
+
+
+    actionMetadataToOrdJSON :: ActionMetadata -> AO.Value
+    actionMetadataToOrdJSON (ActionMetadata name comment definition permissions) =
+      AO.object $ [ ("name", AO.toOrdered name)
+                  , ("definition", actionDefinitionToOrdJSON definition)
+                  ]
+      <> catMaybes [ maybeCommentToMaybeOrdPair comment
+                   , listToMaybeOrdPair "permissions" permToOrdJSON permissions
+                   ]
+      where
+        argDefinitionToOrdJSON :: ArgumentDefinition -> AO.Value
+        argDefinitionToOrdJSON (ArgumentDefinition argName ty descM) =
+          AO.object $  [ ("name", AO.toOrdered argName)
+                       , ("type", AO.toOrdered ty)
+                       ]
+          <> catMaybes [maybeAnyToMaybeOrdPair "description" AO.toOrdered descM]
+
+        actionDefinitionToOrdJSON :: ActionDefinitionInput -> AO.Value
+        actionDefinitionToOrdJSON (ActionDefinition args outputType actionType headers frwrdClientHdrs handler) =
+          let typeAndKind = case actionType of
+                ActionQuery -> [("type", AO.toOrdered ("query" :: String))]
+                ActionMutation kind -> [ ("type", AO.toOrdered ("mutation" :: String))
+                                       , ("kind", AO.toOrdered kind)]
+          in
+          AO.object $ [ ("handler", AO.toOrdered handler)
+                      , ("output_type", AO.toOrdered outputType)
+                      ]
+          <> [("forward_client_headers", AO.toOrdered frwrdClientHdrs) | frwrdClientHdrs]
+          <> catMaybes [ listToMaybeOrdPair "headers" AO.toOrdered headers
+                       , listToMaybeOrdPair "arguments" argDefinitionToOrdJSON args]
+          <> typeAndKind
+
+        permToOrdJSON :: ActionPermissionMetadata -> AO.Value
+        permToOrdJSON (ActionPermissionMetadata role permComment) =
+          AO.object $ [("role", AO.toOrdered role)] <> catMaybes [maybeCommentToMaybeOrdPair permComment]
 
     -- Utility functions
     listToMaybeOrdPair :: Text -> (a -> AO.Value) -> [a] -> Maybe (Text, AO.Value)
@@ -413,6 +565,10 @@ replaceMetadataToOrdJSON ( ReplaceMetadata
     maybeSetToMaybeOrdPair :: Maybe (ColumnValues Value) -> Maybe (Text, AO.Value)
     maybeSetToMaybeOrdPair set = set >>= \colVals -> if colVals == HM.empty then Nothing
                                       else Just ("set", AO.toOrdered colVals)
+
+
+    maybeDescriptionToMaybeOrdPair :: Maybe G.Description -> Maybe (Text, AO.Value)
+    maybeDescriptionToMaybeOrdPair = maybeAnyToMaybeOrdPair "description" AO.toOrdered
 
     maybeCommentToMaybeOrdPair :: Maybe Text -> Maybe (Text, AO.Value)
     maybeCommentToMaybeOrdPair = maybeAnyToMaybeOrdPair "comment" AO.toOrdered

@@ -1,3 +1,9 @@
+.. meta::
+   :description: Update an object in the database using a mutation
+   :keywords: hasura, docs, mutation, update
+
+.. _update:
+
 Update mutation
 ===============
 
@@ -23,13 +29,21 @@ Auto-generated update mutation schema
   type article_mutation_response {
     # number of affected rows by the mutation
     affected_rows: Int!
-    #data of the affected rows by the mutation
+    # data of the affected rows by the mutation
     returning: [article!]!
   }
 
+  # single object update (supported from v1.2.0)
+  update_article_by_pk (
+    _inc: article_inc_input
+    _set: article_set_input
+    # primary key columns arg
+    pk_columns: article_pk_columns_input!
+  ): article
+
 As you can see from the schema:
 
-- The ``where`` argument is compulsory to filter rows to be updated. See :doc:`Filter queries <../queries/query-filters>`
+- The ``where`` argument is compulsory to filter rows to be updated. See :ref:`Filter queries <filter_queries>`
   for filtering options. Objects can be updated based on filters on their own fields or those in their nested objects.
   The ``{}`` expression can be used to update all rows.
 - You can return the number of affected rows and the affected objects (with nested objects) in the response.
@@ -44,20 +58,81 @@ See the :ref:`update mutation API reference <update_syntax>` for the full specif
   - If a table is not in the ``public`` Postgres schema, the update mutation field will be of the format
     ``update_<schema_name>_<table_name>``.
 
-Update based on an object's fields
-----------------------------------
-**Example:** Update the ``title``, ``content`` and ``rating`` of the article with a given ``id``:
+Update an object by its primary key
+-----------------------------------
+
+You can update a single object in a table using the primary key.
+The output type is the nullable table object. The mutation returns the updated
+row object or ``null`` if the row does not exist.
+
+**Example:** Update an article where ``id`` is ``1``:
+
+.. graphiql::
+  :view_only:
+  :query:
+    mutation update_an_article {
+      update_article_by_pk (
+        pk_columns: {id: 1}
+        _set: { is_published: true }
+      ) {
+        id
+        is_published
+      }
+    }
+  :response:
+    {
+      "data": {
+        "update_article_by_pk": {
+          "id": 1,
+          "is_published": true
+        }
+      }
+    }
+
+**Example:** Update a non-existent article:
+
+.. graphiql::
+  :view_only:
+  :query:
+    mutation update_an_article {
+      update_article_by_pk (
+        pk_columns: {id: 100}
+        _set: { is_published: true }
+      ) {
+        id
+        is_published
+      }
+    }
+  :response:
+    {
+      "data": {
+        "update_article_by_pk": null
+      }
+    }
+
+.. note:: 
+
+   ``update_<table>_by_pk`` will **only** be available if you have select permissions on the table, as it returns the updated row.
+
+.. admonition:: Supported from
+
+   The ``update_<table>_by_pk`` mutation is supported in versions ``v1.2.0``
+   and above.
+
+
+Update objects based on their fields
+------------------------------------
+**Example:** Update the ``rating`` and ``is_published`` of articles with a low ``rating``:
 
 .. graphiql::
   :view_only:
   :query:
     mutation update_article {
       update_article(
-        where: {id: {_eq: 3}},
+        where: {rating: {_lte: 2}},
         _set: {
-          title: "lorem ipsum",
-          content: "dolor sit amet",
-          rating: 2
+          rating: 1,
+          is_published: false
         }
       ) {
         affected_rows
@@ -66,6 +141,7 @@ Update based on an object's fields
           title
           content
           rating
+          is_published
         }
       }
     }
@@ -73,13 +149,21 @@ Update based on an object's fields
     {
       "data": {
         "update_article": {
-          "affected_rows": 1,
+          "affected_rows": 2,
           "returning": [
             {
               "id": 3,
-              "title": "lorem ipsum",
-              "content": "dolor sit amet",
-              "rating": 2
+              "title": "article 3",
+              "content": "lorem ipsum dolor sit amet",
+              "rating": 1,
+              "is_published": false
+            },
+            {
+              "id": 6,
+              "title": "article 6",
+              "content": "lorem ipsum dolor sit amet",
+              "rating": 1,
+              "is_published": false
             }
           ]
         }
@@ -91,9 +175,9 @@ Using variables:
 .. graphiql::
   :view_only:
   :query:
-    mutation update_article($id: Int, $changes: article_set_input) {
+    mutation update_article($rating: Int, $changes: article_set_input) {
       update_article(
-        where: {id: {_eq: $id}},
+        where: {rating: {_lte: $rating}},
         _set: $changes
       ) {
         affected_rows
@@ -102,6 +186,7 @@ Using variables:
           title
           content
           rating
+          is_published
         }
       }
     }
@@ -109,13 +194,21 @@ Using variables:
     {
       "data": {
         "update_article": {
-          "affected_rows": 1,
+          "affected_rows": 2,
           "returning": [
             {
               "id": 3,
-              "title": "lorem ipsum",
-              "content": "dolor sit amet",
-              "rating": 2
+              "title": "article 3",
+              "content": "lorem ipsum dolor sit amet",
+              "rating": 1,
+              "is_published": false
+            },
+            {
+              "id": 6,
+              "title": "article 6",
+              "content": "lorem ipsum dolor sit amet",
+              "rating": 1,
+              "is_published": false
             }
           ]
         }
@@ -123,11 +216,10 @@ Using variables:
     }
   :variables:
     {
-      "id": 3,
+      "rating": 2,
       "changes": {
-        "title": "lorem ipsum",
-        "content": "dolor sit amet",
-        "rating": 2
+        "rating": 1,
+        "is_published": false,
       }
     }
 
@@ -136,13 +228,12 @@ OR
 .. graphiql::
   :view_only:
   :query:
-    mutation update_article($id: Int, $title: String, $content: String, $rating: Int) {
+    mutation update_article($ratingLimit: Int, $rating: Int, $isPublished: Boolean) {
       update_article(
-        where: {id: {_eq: $id}},
+        where: {rating: {_lte: $ratingLimit}},
         _set: {
-          title: $title,
-          content: $content,
-          rating: $rating
+          rating: $rating,
+          is_published: $isPublished,
         }
       ) {
         affected_rows
@@ -151,6 +242,7 @@ OR
           title
           content
           rating
+          is_published
         }
       }
     }
@@ -158,13 +250,21 @@ OR
     {
       "data": {
         "update_article": {
-          "affected_rows": 1,
+          "affected_rows": 2,
           "returning": [
             {
               "id": 3,
-              "title": "lorem ipsum",
-              "content": "dolor sit amet",
-              "rating": 2
+              "title": "article 3",
+              "content": "lorem ipsum dolor sit amet",
+              "rating": 1,
+              "is_published": false
+            },
+            {
+              "id": 6,
+              "title": "article 6",
+              "content": "lorem ipsum dolor sit amet",
+              "rating": 1,
+              "is_published": false
             }
           ]
         }
@@ -172,14 +272,13 @@ OR
     }
   :variables:
     {
-      "id": 3,
-      "title": "lorem ipsum",
-      "content": "dolor sit amet",
-      "rating": 2
+      "ratingLimit": 2,
+      "rating": 1,
+      "isPublished": false
     }
 
-Update based on a nested object's fields
-----------------------------------------
+Update objects based on nested objects' fields
+----------------------------------------------
 **Example:** Reset the ``rating`` of all articles authored by "Sidney":
 
 .. graphiql::
@@ -545,5 +644,3 @@ one to delete all the existing objects and one to add a list of new nested objec
     {
       "author_id": 21
     }
-
-

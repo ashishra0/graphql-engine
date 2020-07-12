@@ -1,4 +1,5 @@
-{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RankNTypes      #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Hasura.GraphQL.Transport.WebSocket
   ( createWSServerApp
@@ -7,7 +8,11 @@ module Hasura.GraphQL.Transport.WebSocket
   , WSServerEnv
   ) where
 
-import qualified Control.Concurrent.Async                    as A
+-- NOTE!:
+--   The handler functions 'onClose', 'onMessage', etc. depend for correctness on two properties:
+--     - they run with async exceptions masked
+--     - they do not race on the same connection
+
 import qualified Control.Concurrent.Async.Lifted.Safe        as LA
 import qualified Control.Concurrent.STM                      as STM
 import qualified Control.Monad.Trans.Control                 as MC
@@ -22,35 +27,45 @@ import qualified Data.Text.Encoding                          as TE
 import qualified Data.Time.Clock                             as TC
 import qualified Database.PG.Query                           as Q
 import qualified Language.GraphQL.Draft.Syntax               as G
+import qualified ListT
 import qualified Network.HTTP.Client                         as H
 import qualified Network.HTTP.Types                          as H
+import qualified Network.Wai.Extended                        as Wai
 import qualified Network.WebSockets                          as WS
 import qualified StmContainers.Map                           as STMMap
 
-import           Control.Concurrent                          (threadDelay)
-import qualified ListT
+import           Control.Concurrent.Extended                 (sleep)
+import           Control.Exception.Lifted
+import           Data.String
+import           GHC.AssertNF
 
 import           Hasura.EncJSON
-import           Hasura.GraphQL.Logging
+import           Hasura.GraphQL.Logging                      (MonadQueryLog (..))
 import           Hasura.GraphQL.Transport.HTTP.Protocol
 import           Hasura.GraphQL.Transport.WebSocket.Protocol
+import           Hasura.HTTP
 import           Hasura.Prelude
 import           Hasura.RQL.Types
-import           Hasura.RQL.Types.Error                      (Code (StartFailed))
 import           Hasura.Server.Auth                          (AuthMode, UserAuthentication,
                                                               resolveUserInfo)
-import           Hasura.Server.Context
 import           Hasura.Server.Cors
-import           Hasura.Server.Utils                         (RequestId, diffTimeToMicro,
-                                                              getRequestId, withElapsedTime)
+import           Hasura.Server.Utils                         (RequestId, getRequestId)
+import           Hasura.Server.Version                       (HasVersion)
+import           Hasura.Session
 
 import qualified Hasura.GraphQL.Execute                      as E
 import qualified Hasura.GraphQL.Execute.LiveQuery            as LQ
 import qualified Hasura.GraphQL.Execute.LiveQuery.Poll       as LQ
 import qualified Hasura.GraphQL.Transport.WebSocket.Server   as WS
 import qualified Hasura.Logging                              as L
+import qualified Hasura.Server.Telemetry.Counters            as Telem
 
-
+-- | 'LQ.LiveQueryId' comes from 'Hasura.GraphQL.Execute.LiveQuery.State.addLiveQuery'. We use
+-- this to track a connection's operations so we can remove them from 'LiveQueryState', and
+-- log.
+--
+-- NOTE!: This must be kept consistent with the global 'LiveQueryState', in 'onClose'
+-- and 'onStart'.
 type OperationMap
   = STMMap.Map OperationId (LQ.LiveQueryId, Maybe OperationName)
 
@@ -64,12 +79,22 @@ data ErrRespType
   deriving (Show)
 
 data WSConnState
-  -- headers from the client for websockets
-  = CSNotInitialised !WsHeaders
-  | CSInitError Text
-  -- headers from the client (in conn params) to forward to the remote schema
-  -- and JWT expiry time if any
-  | CSInitialised UserInfo (Maybe TC.UTCTime) [H.Header]
+  = CSNotInitialised !WsHeaders !Wai.IpAddress
+  -- ^ headers and IP address from the client for websockets
+  | CSInitError !Text
+  | CSInitialised !WsClientState
+
+data WsClientState
+  = WsClientState
+  { wscsUserInfo     :: !UserInfo
+  -- ^ the 'UserInfo' required to execute the GraphQL query
+  , wscsTokenExpTime :: !(Maybe TC.UTCTime)
+  -- ^ the JWT/token expiry time, if any
+  , wscsReqHeaders   :: ![H.Header]
+  -- ^ headers from the client (in conn params) to forward to the remote schema
+  , wscsIpAddress    :: !Wai.IpAddress
+  -- ^ IP address required for 'MonadGQLAuthorization'
+  }
 
 data WSConnData
   = WSConnData
@@ -80,6 +105,7 @@ data WSConnData
   -- are not tracked here
   , _wscOpMap     :: !OperationMap
   , _wscErrRespTy :: !ErrRespType
+  , _wscAPIType   :: !E.GraphQLQueryType
   }
 
 type WSServer = WS.WSServer WSConnData
@@ -95,9 +121,14 @@ sendMsgWithMetadata wsConn msg (LQ.LiveQueryMetadata execTime) =
   liftIO $ WS.sendMsg wsConn $ WS.WSQueueResponse bs wsInfo
   where
     bs = encodeServerMsg msg
-    wsInfo = Just $ WS.WSEventInfo
-      { WS._wseiQueryExecutionTime = Just $ realToFrac execTime
-      , WS._wseiResponseSize = Just $ BL.length bs
+    (msgType, operationId) = case msg of
+      (SMData (DataMsg opId _)) -> (Just SMT_GQL_DATA, Just opId)
+      _                         -> (Nothing, Nothing)
+    wsInfo = Just $! WS.WSEventInfo
+      { WS._wseiEventType = msgType
+      , WS._wseiOperationId = operationId
+      , WS._wseiQueryExecutionTime = Just $! realToFrac execTime
+      , WS._wseiResponseSize = Just $! BL.length bs
       }
 
 data OpDetail
@@ -139,14 +170,14 @@ $(J.deriveToJSON
 data WsConnInfo
   = WsConnInfo
   { _wsciWebsocketId :: !WS.WSId
-  , _wsciJwtExpiry   :: !(Maybe TC.UTCTime)
+  , _wsciTokenExpiry :: !(Maybe TC.UTCTime)
   , _wsciMsg         :: !(Maybe Text)
   } deriving (Show, Eq)
 $(J.deriveToJSON (J.aesonDrop 5 J.snakeCase) ''WsConnInfo)
 
 data WSLogInfo
   = WSLogInfo
-  { _wsliUserVars       :: !(Maybe UserVars)
+  { _wsliUserVars       :: !(Maybe SessionVariables)
   , _wsliConnectionInfo :: !WsConnInfo
   , _wsliEvent          :: !WSEvent
   } deriving (Show, Eq)
@@ -162,11 +193,11 @@ instance L.ToEngineLog WSLog L.Hasura where
   toEngineLog (WSLog logLevel wsLog) =
     (logLevel, L.ELTWebsocketLog, J.toJSON wsLog)
 
-mkWsInfoLog :: Maybe UserVars -> WsConnInfo -> WSEvent -> WSLog
+mkWsInfoLog :: Maybe SessionVariables -> WsConnInfo -> WSEvent -> WSLog
 mkWsInfoLog uv ci ev =
   WSLog L.LevelInfo $ WSLogInfo uv ci ev
 
-mkWsErrorLog :: Maybe UserVars -> WsConnInfo -> WSEvent -> WSLog
+mkWsErrorLog :: Maybe SessionVariables -> WsConnInfo -> WSEvent -> WSLog
 mkWsErrorLog uv ci ev =
   WSLog L.LevelError $ WSLogInfo uv ci ev
 
@@ -176,7 +207,7 @@ data WSServerEnv
   , _wseRunTx           :: !PGExecCtx
   , _wseLiveQMap        :: !LQ.LiveQueriesState
   , _wseGCtxMap         :: !(IO (SchemaCache, SchemaCacheVer))
-  -- ^ an action that always returns the latest version of the schema cache
+  -- ^ an action that always returns the latest version of the schema cache. See 'SchemaCacheRef'.
   , _wseHManager        :: !H.Manager
   , _wseCorsPolicy      :: !CorsPolicy
   , _wseSQLCtx          :: !SQLGenCtx
@@ -187,40 +218,39 @@ data WSServerEnv
 
 onConn :: (MonadIO m)
        => L.Logger L.Hasura -> CorsPolicy -> WS.OnConnH m WSConnData
-onConn (L.Logger logger) corsPolicy wsId requestHead = do
+onConn (L.Logger logger) corsPolicy wsId requestHead ipAdress = do
   res <- runExceptT $ do
-    errType <- checkPath
+    (errType, queryType) <- checkPath
     let reqHdrs = WS.requestHeaders requestHead
     headers <- maybe (return reqHdrs) (flip enforceCors reqHdrs . snd) getOrigin
-    return (WsHeaders $ filterWsHeaders headers, errType)
-  either reject (uncurry accept) res
+    return (WsHeaders $ filterWsHeaders headers, errType, queryType)
+  either reject accept res
 
   where
     keepAliveAction wsConn = liftIO $ forever $ do
       sendMsg wsConn SMConnKeepAlive
-      threadDelay $ 5 * 1000 * 1000
+      sleep $ seconds 5
 
-    jwtExpiryHandler wsConn = do
+    tokenExpiryHandler wsConn = do
       expTime <- liftIO $ STM.atomically $ do
         connState <- STM.readTVar $ (_wscUser . WS.getData) wsConn
         case connState of
-          CSNotInitialised _        -> STM.retry
-          CSInitError _              -> STM.retry
-          CSInitialised _ expTimeM _ ->
-            maybe STM.retry return expTimeM
+          CSNotInitialised _ _      -> STM.retry
+          CSInitError _             -> STM.retry
+          CSInitialised clientState -> maybe STM.retry return $ wscsTokenExpTime clientState
       currTime <- TC.getCurrentTime
-      threadDelay $ diffTimeToMicro $ TC.diffUTCTime expTime currTime
+      sleep $ convertDuration $ TC.diffUTCTime expTime currTime
 
-    accept hdrs errType = do
+    accept (hdrs, errType, queryType) = do
       logger $ mkWsInfoLog Nothing (WsConnInfo wsId Nothing Nothing) EAccepted
       connData <- liftIO $ WSConnData
-                  <$> STM.newTVarIO (CSNotInitialised hdrs)
+                  <$> STM.newTVarIO (CSNotInitialised hdrs ipAdress)
                   <*> STMMap.newIO
                   <*> pure errType
+                  <*> pure queryType
       let acceptRequest = WS.defaultAcceptRequest
                           { WS.acceptSubprotocol = Just "graphql-ws"}
-      return $ Right $ WS.AcceptWith connData acceptRequest
-                       (Just keepAliveAction) (Just jwtExpiryHandler)
+      return $ Right $ WS.AcceptWith connData acceptRequest keepAliveAction tokenExpiryHandler
 
     reject qErr = do
       logger $ mkWsErrorLog Nothing (WsConnInfo wsId Nothing Nothing) (ERejected qErr)
@@ -230,10 +260,11 @@ onConn (L.Logger logger) corsPolicy wsId requestHead = do
         (BL.toStrict $ J.encode $ encodeGQLErr False qErr)
 
     checkPath = case WS.requestPath requestHead of
-      "/v1alpha1/graphql" -> return ERTLegacy
-      "/v1/graphql"       -> return ERTGraphqlCompliant
+      "/v1alpha1/graphql" -> return (ERTLegacy, E.QueryHasura)
+      "/v1/graphql"       -> return (ERTGraphqlCompliant, E.QueryHasura)
+      "/v1beta1/relay"    -> return (ERTGraphqlCompliant, E.QueryRelay)
       _                   ->
-        throw404 "only '/v1/graphql', '/v1alpha1/graphql' are supported on websockets"
+        throw404 "only '/v1/graphql', '/v1alpha1/graphql' and '/v1beta1/relay' are supported on websockets"
 
     getOrigin =
       find ((==) "Origin" . fst) (WS.requestHeaders requestHead)
@@ -269,77 +300,116 @@ onConn (L.Logger logger) corsPolicy wsId requestHead = do
             <> "CORS on websocket connections, then you can use the flag --ws-read-cookie or "
             <> "HASURA_GRAPHQL_WS_READ_COOKIE to force read cookie when CORS is disabled."
 
-
-onStart :: WSServerEnv -> WSConn -> StartMsg -> IO ()
+onStart
+  :: forall m. (HasVersion, MonadIO m, E.MonadGQLExecutionCheck m, MonadQueryLog m)
+  => WSServerEnv -> WSConn -> StartMsg -> m ()
 onStart serverEnv wsConn (StartMsg opId q) = catchAndIgnore $ do
-
+  timerTot <- startTimer
   opM <- liftIO $ STM.atomically $ STMMap.lookup opId opMap
 
+  -- NOTE: it should be safe to rely on this check later on in this function, since we expect that
+  -- we process all operations on a websocket connection serially:
   when (isJust opM) $ withComplete $ sendStartErr $
     "an operation already exists with this id: " <> unOperationId opId
 
   userInfoM <- liftIO $ STM.readTVarIO userInfoR
-  (userInfo, reqHdrs) <- case userInfoM of
-    CSInitialised userInfo _ reqHdrs -> return (userInfo, reqHdrs)
+  (userInfo, reqHdrs, ipAddress) <- case userInfoM of
+    CSInitialised WsClientState{..} -> return (wscsUserInfo, wscsReqHeaders, wscsIpAddress)
     CSInitError initErr -> do
       let e = "cannot start as connection_init failed with : " <> initErr
       withComplete $ sendStartErr e
-    CSNotInitialised _ -> do
+    CSNotInitialised _ _ -> do
       let e = "start received before the connection is initialised"
       withComplete $ sendStartErr e
 
   requestId <- getRequestId reqHdrs
   (sc, scVer) <- liftIO getSchemaCache
+
+  reqParsedE <- lift $ E.checkGQLExecution userInfo (reqHdrs, ipAddress) enableAL sc q
+  reqParsed <- either (withComplete . preExecErr requestId) return reqParsedE
   execPlanE <- runExceptT $ E.getResolvedExecPlan pgExecCtx
-               planCache userInfo sqlGenCtx enableAL sc scVer q
-  execPlan <- either (withComplete . preExecErr requestId) return execPlanE
-  let execCtx = E.ExecutionCtx logger sqlGenCtx pgExecCtx
-                planCache sc scVer httpMgr enableAL
+               planCache userInfo sqlGenCtx sc scVer queryType httpMgr reqHdrs (q, reqParsed)
+
+  (telemCacheHit, execPlan) <- either (withComplete . preExecErr requestId) return execPlanE
+  let execCtx = E.ExecutionCtx logger sqlGenCtx pgExecCtx planCache sc scVer httpMgr enableAL
 
   case execPlan of
     E.GExPHasura resolvedOp ->
-      runHasuraGQ requestId q userInfo resolvedOp
+      runHasuraGQ timerTot telemCacheHit requestId q userInfo resolvedOp
     E.GExPRemote rsi opDef  ->
-      runRemoteGQ execCtx requestId userInfo reqHdrs opDef rsi
+      runRemoteGQ timerTot telemCacheHit execCtx requestId userInfo reqHdrs opDef rsi
   where
-    runHasuraGQ :: RequestId -> GQLReqUnparsed -> UserInfo -> E.ExecOp
-                -> ExceptT () IO ()
-    runHasuraGQ reqId query userInfo = \case
+    telemTransport = Telem.HTTP
+    runHasuraGQ :: ExceptT () m DiffTime
+                -> Telem.CacheHit -> RequestId -> GQLReqUnparsed -> UserInfo -> E.ExecOp
+                -> ExceptT () m ()
+    runHasuraGQ timerTot telemCacheHit reqId query userInfo = \case
       E.ExOpQuery opTx genSql ->
-        execQueryOrMut reqId query genSql $ runLazyTx' pgExecCtx opTx
-      E.ExOpMutation opTx ->
-        execQueryOrMut reqId query Nothing $
+        execQueryOrMut Telem.Query genSql $ runQueryTx pgExecCtx opTx
+      -- Response headers discarded over websockets
+      E.ExOpMutation _ opTx ->
+        execQueryOrMut Telem.Mutation Nothing $
           runLazyTx pgExecCtx Q.ReadWrite $ withUserInfo userInfo opTx
       E.ExOpSubs lqOp -> do
         -- log the graphql query
-        L.unLogger logger $ QueryLog query Nothing reqId
-        lqId <- liftIO $ LQ.addLiveQuery lqMap lqOp liveQOnChange
+        -- L.unLogger logger $ QueryLog query Nothing reqId
+        logQueryLog logger query Nothing reqId
+        let subscriberMetadata = LQ.mkSubscriberMetadata $ J.object
+                                 [ "websocket_id" J..= WS.getWSId wsConn
+                                 , "operation_id" J..= opId
+                                 ]
+        -- NOTE!: we mask async exceptions higher in the call stack, but it's
+        -- crucial we don't lose lqId after addLiveQuery returns successfully.
+        !lqId <- liftIO $ LQ.addLiveQuery logger subscriberMetadata lqMap lqOp liveQOnChange
+        let !opName = _grOperationName q
+        liftIO $ $assertNFHere $! (lqId, opName)  -- so we don't write thunks to mutable vars
+
         liftIO $ STM.atomically $
-          STMMap.insert (lqId, _grOperationName q) opId opMap
+          -- NOTE: see crucial `lookup` check above, ensuring this doesn't clobber:
+          STMMap.insert (lqId, opName) opId opMap
         logOpEv ODStarted (Just reqId)
 
-    execQueryOrMut reqId query genSql action = do
-      logOpEv ODStarted (Just reqId)
-      -- log the generated SQL and the graphql query
-      L.unLogger logger $ QueryLog query genSql reqId
-      (dt, resp) <- withElapsedTime $ liftIO $ runExceptT action
-      let lqMeta = LQ.LiveQueryMetadata dt
-      either (postExecErr reqId) (`sendSuccResp` lqMeta) resp
-      sendCompleted (Just reqId)
+      where
+        telemLocality = Telem.Local
+        execQueryOrMut telemQueryType genSql action = do
+          logOpEv ODStarted (Just reqId)
+          -- log the generated SQL and the graphql query
+          logQueryLog logger query genSql reqId
+          (withElapsedTime $ runExceptT action) >>= \case
+            (_,      Left err) -> postExecErr reqId err
+            (telemTimeIO_DT, Right encJson) -> do
+              -- Telemetry. NOTE: don't time network IO:
+              telemTimeTot <- Seconds <$> timerTot
+              sendSuccResp encJson $ LQ.LiveQueryMetadata telemTimeIO_DT
+              let telemTimeIO = convertDuration telemTimeIO_DT
+              Telem.recordTimingMetric Telem.RequestDimensions{..} Telem.RequestTimings{..}
 
-    runRemoteGQ :: E.ExecutionCtx -> RequestId -> UserInfo -> [H.Header]
+          sendCompleted (Just reqId)
+
+    runRemoteGQ :: ExceptT () m DiffTime
+                -> Telem.CacheHit -> E.ExecutionCtx -> RequestId -> UserInfo -> [H.Header]
                 -> G.TypedOperationDefinition -> RemoteSchemaInfo
-                -> ExceptT () IO ()
-    runRemoteGQ execCtx reqId userInfo reqHdrs opDef rsi = do
-      when (G._todType opDef == G.OperationTypeSubscription) $
-        withComplete $ preExecErr reqId $
-        err400 NotSupported "subscription to remote server is not supported"
+                -> ExceptT () m ()
+    runRemoteGQ timerTot telemCacheHit execCtx reqId userInfo reqHdrs opDef rsi = do
+      let telemLocality = Telem.Remote
+      telemQueryType <- case G._todType opDef of
+        G.OperationTypeSubscription ->
+          withComplete $ preExecErr reqId $
+          err400 NotSupported "subscription to remote server is not supported"
+        G.OperationTypeMutation -> return Telem.Mutation
+        G.OperationTypeQuery    -> return Telem.Query
 
       -- if it's not a subscription, use HTTP to execute the query on the remote
-      (dt, resp) <- withElapsedTime $ runExceptT $ flip runReaderT execCtx $
-              E.execRemoteGQ reqId userInfo reqHdrs q rsi opDef
-      let ocMeta = LQ.LiveQueryMetadata dt
-      either (postExecErr reqId) (\val -> sendRemoteResp reqId (_hrBody val) ocMeta) resp
+      (runExceptT $ flip runReaderT execCtx $
+        E.execRemoteGQ reqId userInfo reqHdrs q rsi (G._todType opDef)) >>= \case
+          Left  err           -> postExecErr reqId err
+          Right (telemTimeIO_DT, !val) -> do
+            -- Telemetry. NOTE: don't time network IO:
+            telemTimeTot <- Seconds <$> timerTot
+            sendRemoteResp reqId (_hrBody val) $ LQ.LiveQueryMetadata telemTimeIO_DT
+            let telemTimeIO = convertDuration telemTimeIO_DT
+            Telem.recordTimingMetric Telem.RequestDimensions{..} Telem.RequestTimings{..}
+
       sendCompleted (Just reqId)
 
     sendRemoteResp reqId resp meta =
@@ -353,17 +423,16 @@ onStart serverEnv wsConn (StartMsg opId q) = catchAndIgnore $ do
     WSServerEnv logger pgExecCtx lqMap getSchemaCache httpMgr _ sqlGenCtx planCache
       _ enableAL = serverEnv
 
-    WSConnData userInfoR opMap errRespTy = WS.getData wsConn
+    WSConnData userInfoR opMap errRespTy queryType = WS.getData wsConn
 
-    logOpEv opTy reqId =
-      logWSEvent logger wsConn $ EOperation opDet
+    logOpEv opTy reqId = logWSEvent logger wsConn $ EOperation opDet
       where
         opDet = OperationDetails opId reqId (_grOperationName q) opTy query
         -- log the query only in errors
-        query = case opTy of
-          ODQueryErr _ -> Just q
-          _            -> Nothing
-
+        query =
+          case opTy of
+            ODQueryErr _ -> Just q
+            _            -> Nothing
     getErrFn errTy =
       case errTy of
         ERTLegacy           -> encodeQErr
@@ -376,7 +445,7 @@ onStart serverEnv wsConn (StartMsg opId q) = catchAndIgnore $ do
       logOpEv (ODProtoErr e) Nothing
 
     sendCompleted reqId = do
-      sendMsg wsConn (SMComplete $ CompletionMsg opId)
+      liftIO $ sendMsg wsConn (SMComplete $ CompletionMsg opId)
       logOpEv ODCompleted reqId
 
     postExecErr reqId qErr = do
@@ -394,11 +463,12 @@ onStart serverEnv wsConn (StartMsg opId q) = catchAndIgnore $ do
             ERTGraphqlCompliant -> J.object ["errors" J..= [errFn False qErr]]
       sendMsg wsConn (SMErr $ ErrorMsg opId err)
 
+    -- sendSuccResp :: _
     sendSuccResp encJson =
       sendMsgWithMetadata wsConn
         (SMData $ DataMsg opId $ GRHasura $ GQSuccess $ encJToLBS encJson)
 
-    withComplete :: ExceptT () IO () -> ExceptT () IO a
+    withComplete :: ExceptT () m () -> ExceptT () m a
     withComplete action = do
       action
       sendCompleted Nothing
@@ -406,17 +476,19 @@ onStart serverEnv wsConn (StartMsg opId q) = catchAndIgnore $ do
 
     -- on change, send message on the websocket
     liveQOnChange :: LQ.OnChange
-    liveQOnChange (GQSuccess (LQ.LiveQueryResponse bs dTime)) =
-      sendMsgWithMetadata wsConn (SMData $ DataMsg opId $ GRHasura $ GQSuccess bs) $
-        LQ.LiveQueryMetadata dTime
-    liveQOnChange resp = sendMsg wsConn $ SMData $ DataMsg opId $ GRHasura $ 
-      LQ._lqrPayload <$> resp
+    liveQOnChange = \case
+      GQSuccess (LQ.LiveQueryResponse bs dTime) ->
+        sendMsgWithMetadata wsConn
+        (SMData $ DataMsg opId $ GRHasura $ GQSuccess $ BL.fromStrict bs)
+        (LQ.LiveQueryMetadata dTime)
+      resp -> sendMsg wsConn $ SMData $ DataMsg opId $ GRHasura $
+        (BL.fromStrict . LQ._lqrPayload) <$> resp
 
-    catchAndIgnore :: ExceptT () IO () -> IO ()
+    catchAndIgnore :: ExceptT () m () -> m ()
     catchAndIgnore m = void $ runExceptT m
 
 onMessage
-  :: (MonadIO m, UserAuthentication m)
+  :: (HasVersion, MonadIO m, UserAuthentication m, E.MonadGQLExecutionCheck m, MonadQueryLog m)
   => AuthMode
   -> WSServerEnv
   -> WSConn -> BL.ByteString -> m ()
@@ -431,21 +503,34 @@ onMessage authMode serverEnv wsConn msgRaw =
       CMConnInit params -> onConnInit (_wseLogger serverEnv)
                            (_wseHManager serverEnv)
                            wsConn authMode params
-      CMStart startMsg  -> liftIO $ onStart serverEnv wsConn startMsg
+      CMStart startMsg  -> onStart serverEnv wsConn startMsg
       CMStop stopMsg    -> liftIO $ onStop serverEnv wsConn stopMsg
+      -- The idea is cleanup will be handled by 'onClose', but...
+      -- NOTE: we need to close the websocket connection when we receive the
+      -- CMConnTerm message and calling WS.closeConn will definitely throw an
+      -- exception, but I'm not sure if 'closeConn' is the correct thing here....
       CMConnTerm        -> liftIO $ WS.closeConn wsConn "GQL_CONNECTION_TERMINATE received"
   where
     logger = _wseLogger serverEnv
 
 onStop :: WSServerEnv -> WSConn -> StopMsg -> IO ()
 onStop serverEnv wsConn (StopMsg opId) = do
-  -- probably wrap the whole thing in a single tx?
+  -- When a stop message is received for an operation, it may not be present in OpMap
+  -- in these cases:
+  -- 1. If the operation is a query/mutation - as we remove the operation from the
+  -- OpMap as soon as it is executed
+  -- 2. A misbehaving client
+  -- 3. A bug on our end
   opM <- liftIO $ STM.atomically $ STMMap.lookup opId opMap
   case opM of
     Just (lqId, opNameM) -> do
       logWSEvent logger wsConn $ EOperation $ opDet opNameM
-      LQ.removeLiveQuery lqMap lqId
-    Nothing    -> return ()
+      LQ.removeLiveQuery logger lqMap lqId
+    Nothing    ->
+      L.unLogger logger $ L.UnstructuredLog L.LevelDebug $ fromString $
+        "Received STOP for an operation that we have no record for: "
+        <> show (unOperationId opId)
+        <> " (could be a query/mutation operation or a misbehaving client or a bug)"
   STM.atomically $ STMMap.delete opId opMap
   where
     logger = _wseLogger serverEnv
@@ -458,14 +543,14 @@ logWSEvent
   => L.Logger L.Hasura -> WSConn -> WSEvent -> m ()
 logWSEvent (L.Logger logger) wsConn wsEv = do
   userInfoME <- liftIO $ STM.readTVarIO userInfoR
-  let (userVarsM, jwtExpM) = case userInfoME of
-        CSInitialised userInfo jwtM _ -> ( Just $ userVars userInfo
-                                         , jwtM
-                                         )
-        _                             -> (Nothing, Nothing)
-  liftIO $ logger $ WSLog logLevel $ WSLogInfo userVarsM (WsConnInfo wsId jwtExpM Nothing) wsEv
+  let (userVarsM, tokenExpM) = case userInfoME of
+        CSInitialised WsClientState{..} -> ( Just $ _uiSession wscsUserInfo
+                                           , wscsTokenExpTime
+                                           )
+        _                               -> (Nothing, Nothing)
+  liftIO $ logger $ WSLog logLevel $ WSLogInfo userVarsM (WsConnInfo wsId tokenExpM Nothing) wsEv
   where
-    WSConnData userInfoR _ _ = WS.getData wsConn
+    WSConnData userInfoR _ _ _ = WS.getData wsConn
     wsId = WS.getWSId wsConn
     logLevel = bool L.LevelInfo L.LevelError isError
     isError = case wsEv of
@@ -473,7 +558,7 @@ logWSEvent (L.Logger logger) wsConn wsEv = do
       ERejected _ -> True
       EConnErr _  -> True
       EClosed     -> False
-      EOperation op -> case _odOperationType op of
+      EOperation operation -> case _odOperationType operation of
         ODStarted    -> False
         ODProtoErr _ -> True
         ODQueryErr _ -> True
@@ -481,26 +566,54 @@ logWSEvent (L.Logger logger) wsConn wsEv = do
         ODStopped    -> False
 
 onConnInit
-  :: (MonadIO m, UserAuthentication m)
+  :: (HasVersion, MonadIO m, UserAuthentication m)
   => L.Logger L.Hasura -> H.Manager -> WSConn -> AuthMode -> Maybe ConnParams -> m ()
 onConnInit logger manager wsConn authMode connParamsM = do
-  headers <- mkHeaders <$> liftIO (STM.readTVarIO (_wscUser $ WS.getData wsConn))
-  res <- resolveUserInfo logger manager headers authMode
-  case res of
-    Left e  -> do
-      liftIO $ STM.atomically $ STM.writeTVar (_wscUser $ WS.getData wsConn) $
-        CSInitError $ qeError e
-      let connErr = ConnErrMsg $ qeError e
+  -- TODO: what should be the behaviour of connection_init message when a
+  -- connection is already iniatilized? Currently, we seem to be doing
+  -- something arbitrary which isn't correct. Ideally, we should stick to
+  -- this:
+  --
+  -- > Allow connection_init message only when the connection state is
+  -- 'not initialised'. This means that there is no reason for the
+  -- connection to be in `CSInitError` state.
+  connState <- liftIO (STM.readTVarIO (_wscUser $ WS.getData wsConn))
+  case getIpAddress connState of
+    Left err -> unexpectedInitError err
+    Right ipAddress -> do
+      let headers = mkHeaders connState
+      res <- resolveUserInfo logger manager headers authMode
+      case res of
+        Left e  -> do
+          let !initErr = CSInitError $ qeError e
+          liftIO $ do
+            $assertNFHere initErr  -- so we don't write thunks to mutable vars
+            STM.atomically $ STM.writeTVar (_wscUser $ WS.getData wsConn) initErr
+
+          let connErr = ConnErrMsg $ qeError e
+          logWSEvent logger wsConn $ EConnErr connErr
+          sendMsg wsConn $ SMConnErr connErr
+        Right (userInfo, expTimeM) -> do
+          let !csInit =  CSInitialised $ WsClientState userInfo expTimeM paramHeaders ipAddress
+          liftIO $ do
+            $assertNFHere csInit  -- so we don't write thunks to mutable vars
+            STM.atomically $ STM.writeTVar (_wscUser $ WS.getData wsConn) csInit
+
+          sendMsg wsConn SMConnAck
+          -- TODO: send it periodically? Why doesn't apollo's protocol use
+          -- ping/pong frames of websocket spec?
+          sendMsg wsConn SMConnKeepAlive
+  where
+    unexpectedInitError e = do
+      let connErr = ConnErrMsg e
       logWSEvent logger wsConn $ EConnErr connErr
       sendMsg wsConn $ SMConnErr connErr
-    Right (userInfo, expTimeM) -> do
-      liftIO $ STM.atomically $ STM.writeTVar (_wscUser $ WS.getData wsConn) $
-        CSInitialised userInfo expTimeM paramHeaders
-      sendMsg wsConn SMConnAck
-      -- TODO: send it periodically? Why doesn't apollo's protocol use
-      -- ping/pong frames of websocket spec?
-      sendMsg wsConn SMConnKeepAlive
-  where
+
+    getIpAddress = \case
+      CSNotInitialised _ ip -> return ip
+      CSInitialised WsClientState{..} -> return wscsIpAddress
+      CSInitError e -> Left e
+
     mkHeaders st =
       paramHeaders ++ getClientHdrs st
 
@@ -510,8 +623,8 @@ onConnInit logger manager wsConn authMode connParamsM = do
       ]
 
     getClientHdrs st = case st of
-      CSNotInitialised h -> unWsHeaders h
-      _                  -> []
+      CSNotInitialised h _ -> unWsHeaders h
+      _                    -> []
 
 onClose
   :: MonadIO m
@@ -522,8 +635,8 @@ onClose
 onClose logger lqMap wsConn = do
   logWSEvent logger wsConn EClosed
   operations <- liftIO $ STM.atomically $ ListT.toList $ STMMap.listT opMap
-  void $ liftIO $ A.forConcurrently operations $ \(_, (lqId, _)) ->
-    LQ.removeLiveQuery lqMap lqId
+  liftIO $ for_ operations $ \(_, (lqId, _)) ->
+    LQ.removeLiveQuery logger lqMap lqId
   where
     opMap = _wscOpMap $ WS.getData wsConn
 
@@ -547,23 +660,28 @@ createWSServerEnv logger pgExecCtx lqState getSchemaCache httpManager
     sqlGenCtx planCache wsServer enableAL
 
 createWSServerApp
-  :: ( MonadIO m
+  :: ( HasVersion
+     , MonadIO m
      , MC.MonadBaseControl IO m
      , LA.Forall (LA.Pure m)
      , UserAuthentication m
+     , WS.MonadWSLog m
+     , E.MonadGQLExecutionCheck m
+     , MonadQueryLog m
      )
   => AuthMode
   -> WSServerEnv
-  -> WS.PendingConnection -> m ()
+  -> WS.HasuraServerApp m
   -- ^ aka generalized 'WS.ServerApp'
-createWSServerApp authMode serverEnv =
-  WS.createServerApp (_wseServer serverEnv) handlers
+createWSServerApp authMode serverEnv = \ !ipAddress !pendingConn ->
+  WS.createServerApp (_wseServer serverEnv) handlers ipAddress pendingConn
   where
     handlers =
       WS.WSHandlers
-      (onConn (_wseLogger serverEnv) (_wseCorsPolicy serverEnv))
-      (onMessage authMode serverEnv)
-      (onClose (_wseLogger serverEnv) $ _wseLiveQMap serverEnv)
+      -- Mask async exceptions during event processing to help maintain integrity of mutable vars:
+      (\rid rh ip ->  mask_ $ onConn (_wseLogger serverEnv) (_wseCorsPolicy serverEnv) rid rh ip)
+      (\conn bs -> mask_ $ onMessage authMode serverEnv conn bs)
+      (\conn ->    mask_ $ onClose (_wseLogger serverEnv) (_wseLiveQMap serverEnv) conn)
 
 stopWSServerApp :: WSServerEnv -> IO ()
 stopWSServerApp wsEnv = WS.shutdown (_wseServer wsEnv)

@@ -1,4 +1,8 @@
-.. _enable-https:
+.. meta::
+   :description: Enable HTTPS with Hasura GraphQL engine
+   :keywords: hasura, docs, deployment, https
+
+.. _enable_https:
 
 Enable HTTPS
 ============
@@ -59,6 +63,14 @@ Here is a sample ``Caddyfile`` to proxy requests to Hasura:
    hasura.my-domain.com {
      proxy / http://localhost:8080
      websocket
+   }
+
+The sample ``Caddyfile`` for Caddy 2: 
+
+.. code-block:: bash
+
+   hasura.my-domain.com {
+     reverse_proxy localhost:8080
    }
 
 Caddy has SSL provisioning built-in with Let's Encrypt. You can find the docs at

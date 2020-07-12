@@ -47,6 +47,16 @@ CREATE TABLE hdb_catalog.hdb_relationship
     FOREIGN KEY (table_schema, table_name) REFERENCES hdb_catalog.hdb_table(table_schema, table_name) ON UPDATE CASCADE
 );
 
+CREATE TABLE hdb_catalog.hdb_remote_relationship
+(
+  remote_relationship_name TEXT NOT NULL,
+  table_schema name NOT NULL,
+  table_name name NOT NULL,
+  definition JSONB NOT NULL,
+  PRIMARY KEY (remote_relationship_name, table_schema, table_name),
+  FOREIGN KEY (table_schema, table_name) REFERENCES hdb_catalog.hdb_table(table_schema, table_name) ON UPDATE CASCADE
+);
+
 CREATE TABLE hdb_catalog.hdb_permission
 (
     table_schema name, -- See Note [Reference system columns using type name]
@@ -300,6 +310,7 @@ CREATE TABLE hdb_catalog.event_log
 CREATE INDEX ON hdb_catalog.event_log (trigger_name);
 CREATE INDEX ON hdb_catalog.event_log (locked);
 CREATE INDEX ON hdb_catalog.event_log (delivered);
+CREATE INDEX ON hdb_catalog.event_log (created_at);
 
 CREATE TABLE hdb_catalog.event_invocation_logs
 (
@@ -411,7 +422,8 @@ CREATE TABLE hdb_catalog.remote_schemas (
 
 CREATE TABLE hdb_catalog.hdb_schema_update_event (
   instance_id uuid NOT NULL,
-  occurred_at timestamptz NOT NULL DEFAULT NOW()
+  occurred_at timestamptz NOT NULL DEFAULT NOW(),
+  invalidations json NOT NULL
 );
 
 CREATE UNIQUE INDEX hdb_schema_update_event_one_row
@@ -422,13 +434,16 @@ $function$
   DECLARE
     instance_id uuid;
     occurred_at timestamptz;
+    invalidations json;
     curr_rec record;
   BEGIN
     instance_id = NEW.instance_id;
     occurred_at = NEW.occurred_at;
+    invalidations = NEW.invalidations;
     PERFORM pg_notify('hasura_schema_update', json_build_object(
       'instance_id', instance_id,
-      'occurred_at', occurred_at
+      'occurred_at', occurred_at,
+      'invalidations', invalidations
       )::text);
     RETURN curr_rec;
   END;
@@ -655,4 +670,148 @@ CREATE VIEW hdb_catalog.hdb_computed_field_function AS
       ELSE (definition::jsonb -> 'function')::jsonb ->> 'schema'
     END AS function_schema
   FROM hdb_catalog.hdb_computed_field
+);
+
+CREATE OR REPLACE FUNCTION hdb_catalog.check_violation(msg text) RETURNS bool AS
+$$
+  BEGIN
+    RAISE check_violation USING message=msg;
+  END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE hdb_catalog.hdb_action
+(
+  action_name TEXT PRIMARY KEY,
+  action_defn JSONB NOT NULL,
+  comment TEXT NULL,
+  is_system_defined boolean default false
+);
+
+CREATE TABLE hdb_catalog.hdb_action_permission
+(
+  action_name TEXT NOT NULL,
+  role_name TEXT NOT NULL,
+  definition JSONB NOT NULL DEFAULT '{}'::jsonb,
+  comment    TEXT NULL,
+
+  PRIMARY KEY (action_name, role_name),
+  FOREIGN KEY (action_name) REFERENCES hdb_catalog.hdb_action(action_name) ON UPDATE CASCADE
+);
+
+CREATE TABLE hdb_catalog.hdb_action_log
+(
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- we deliberately do not reference the action name
+  -- because sometimes we may want to retain history
+  -- after dropping the action
+  action_name TEXT,
+  input_payload JSONB NOT NULL,
+  request_headers JSONB NOT NULL,
+  session_variables JSONB NOT NULL,
+  response_payload JSONB NULL,
+  errors JSONB NULL,
+  created_at timestamptz NOT NULL default now(),
+  response_received_at timestamptz NULL,
+  status text NOT NULL,
+  CHECK (status IN ('created', 'processing', 'completed', 'error'))
+);
+
+CREATE TABLE hdb_catalog.hdb_custom_types
+(
+  custom_types jsonb NOT NULL
+);
+
+CREATE VIEW hdb_catalog.hdb_role AS
+(
+  SELECT DISTINCT role_name FROM (
+    SELECT role_name FROM hdb_catalog.hdb_permission
+    UNION ALL
+    SELECT role_name FROM hdb_catalog.hdb_action_permission
+  ) q
+);
+
+CREATE TABLE hdb_catalog.hdb_cron_triggers
+(
+  name TEXT PRIMARY KEY,
+  webhook_conf JSON NOT NULL,
+  cron_schedule TEXT NOT NULL,
+  payload JSON,
+  retry_conf JSON,
+  header_conf JSON,
+  include_in_metadata BOOLEAN NOT NULL DEFAULT FALSE,
+  comment TEXT
+);
+
+CREATE TABLE hdb_catalog.hdb_cron_events
+(
+  id TEXT DEFAULT gen_random_uuid() PRIMARY KEY,
+  trigger_name TEXT NOT NULL,
+  scheduled_time TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL DEFAULT 'scheduled',
+  tries INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  next_retry_at TIMESTAMPTZ,
+
+  FOREIGN KEY (trigger_name) REFERENCES hdb_catalog.hdb_cron_triggers(name)
+    ON UPDATE CASCADE ON DELETE CASCADE,
+  CONSTRAINT valid_status CHECK (status IN ('scheduled','locked','delivered','error','dead'))
+);
+
+CREATE INDEX hdb_cron_event_status ON hdb_catalog.hdb_cron_events (status);
+
+CREATE TABLE hdb_catalog.hdb_cron_event_invocation_logs
+(
+  id TEXT DEFAULT gen_random_uuid() PRIMARY KEY,
+  event_id TEXT,
+  status INTEGER,
+  request JSON,
+  response JSON,
+  created_at TIMESTAMP DEFAULT NOW(),
+
+  FOREIGN KEY (event_id) REFERENCES hdb_catalog.hdb_cron_events (id)
+    ON UPDATE CASCADE ON DELETE CASCADE
+);
+
+CREATE VIEW hdb_catalog.hdb_cron_events_stats AS
+  SELECT ct.name,
+         COALESCE(ce.upcoming_events_count,0) as upcoming_events_count,
+         COALESCE(ce.max_scheduled_time, now()) as max_scheduled_time
+  FROM hdb_catalog.hdb_cron_triggers ct
+  LEFT JOIN
+  ( SELECT trigger_name, count(*) as upcoming_events_count, max(scheduled_time) as max_scheduled_time
+    FROM hdb_catalog.hdb_cron_events
+    WHERE tries = 0 and status = 'scheduled'
+    GROUP BY trigger_name
+  ) ce
+  ON ct.name = ce.trigger_name;
+
+CREATE TABLE hdb_catalog.hdb_scheduled_events
+(
+  id TEXT DEFAULT gen_random_uuid() PRIMARY KEY,
+  webhook_conf JSON NOT NULL,
+  scheduled_time TIMESTAMPTZ NOT NULL,
+  retry_conf JSON,
+  payload JSON,
+  header_conf JSON,
+  status TEXT NOT NULL DEFAULT 'scheduled',
+  tries INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  next_retry_at TIMESTAMPTZ,
+  comment TEXT,
+  CONSTRAINT valid_status CHECK (status IN ('scheduled','locked','delivered','error','dead'))
+);
+
+CREATE INDEX hdb_scheduled_event_status ON hdb_catalog.hdb_scheduled_events (status);
+
+CREATE TABLE hdb_catalog.hdb_scheduled_event_invocation_logs
+(
+id TEXT DEFAULT gen_random_uuid() PRIMARY KEY,
+event_id TEXT,
+status INTEGER,
+request JSON,
+response JSON,
+created_at TIMESTAMP DEFAULT NOW(),
+
+FOREIGN KEY (event_id) REFERENCES hdb_catalog.hdb_scheduled_events (id)
+   ON DELETE CASCADE ON UPDATE CASCADE
 );

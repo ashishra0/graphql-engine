@@ -64,11 +64,12 @@ data ColExp
   { ceCol :: !FieldName
   , ceVal :: !Value
   } deriving (Show, Eq, Lift, Data, Generic)
+instance NFData ColExp
 instance Cacheable ColExp
 
 newtype BoolExp
   = BoolExp { unBoolExp :: GBoolExp ColExp }
-  deriving (Show, Eq, Lift, Generic, Cacheable)
+  deriving (Show, Eq, Lift, Generic, NFData, Cacheable)
 
 $(makeWrapped ''BoolExp)
 
@@ -100,6 +101,7 @@ instance (FromJSON a) => FromJSON (DMLQuery a) where
 newtype OrderType
   = OrderType { unOrderType :: S.OrderType }
   deriving (Show, Eq, Lift, Generic)
+instance Hashable OrderType
 
 instance FromJSON OrderType where
   parseJSON =
@@ -111,6 +113,7 @@ instance FromJSON OrderType where
 newtype NullsOrder
   = NullsOrder { unNullsOrder :: S.NullsOrder }
   deriving (Show, Eq, Lift, Generic)
+instance Hashable NullsOrder
 
 instance FromJSON NullsOrder where
   parseJSON =
@@ -175,7 +178,8 @@ data OrderByItemG a
   { obiType   :: !(Maybe OrderType)
   , obiColumn :: !a
   , obiNulls  :: !(Maybe NullsOrder)
-  } deriving (Show, Eq, Lift, Functor, Foldable, Traversable)
+  } deriving (Show, Eq, Lift, Functor, Foldable, Traversable, Generic)
+instance (Hashable a) => Hashable (OrderByItemG a)
 
 type OrderByItem = OrderByItemG OrderByCol
 

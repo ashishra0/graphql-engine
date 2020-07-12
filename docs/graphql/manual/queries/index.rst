@@ -1,3 +1,9 @@
+.. meta::
+   :description: Manage queries with Hasura
+   :keywords: hasura, docs, query
+
+.. _queries:
+
 Queries
 =======
 
@@ -34,7 +40,13 @@ Auto-generated query field schema
       order_by:  [author_order_by!]
     ): [author]
 
-See the :doc:`Query API reference <../api-reference/graphql-api/query>` for the full specifications
+    # single object select
+    author_by_pk (
+      # all primary key columns args
+      id: Int!
+    ): author
+
+See the :ref:`Query API reference <graphql_api_query>` for the full specifications.
 
 .. note::
 
@@ -61,4 +73,5 @@ based on a typical author/article schema for reference.
   pagination
   Using multiple arguments <multiple-arguments>
   multiple-queries
-  variables-aliases-fragments-directives
+  Using variables / aliases / fragments / directives <variables-aliases-fragments-directives>
+  performance

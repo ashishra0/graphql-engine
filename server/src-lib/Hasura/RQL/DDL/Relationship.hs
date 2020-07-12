@@ -12,21 +12,23 @@ module Hasura.RQL.DDL.Relationship
   )
 where
 
-import qualified Database.PG.Query                 as Q
-
+import           Hasura.RQL.Types.Common
+import           Hasura.RQL.Types.SchemaCacheTypes
 import           Hasura.EncJSON
 import           Hasura.Prelude
 import           Hasura.RQL.DDL.Deps
-import           Hasura.RQL.DDL.Permission         (purgePerm)
+import           Hasura.RQL.DDL.Permission                  (purgePerm)
 import           Hasura.RQL.DDL.Relationship.Types
 import           Hasura.RQL.Types
 import           Hasura.SQL.Types
 
 import           Data.Aeson.Types
-import qualified Data.HashMap.Strict               as HM
-import qualified Data.HashSet                      as HS
-import           Data.Tuple                        (swap)
-import           Instances.TH.Lift                 ()
+import           Data.Tuple                                 (swap)
+import           Instances.TH.Lift                          ()
+
+import qualified Data.HashMap.Strict                        as HM
+import qualified Data.HashSet                               as HS
+import qualified Database.PG.Query                          as Q
 
 runCreateRelationship
   :: (MonadTx m, CacheRWM m, HasSystemDefined m, ToJSON a)
@@ -90,7 +92,7 @@ objRelP2Setup
   -> RelDef ObjRelUsing
   -> m (RelInfo, [SchemaDependency])
 objRelP2Setup qt foreignKeys (RelDef rn ru _) = case ru of
-  RUManual (ObjRelManualConfig rm) -> do
+  RUManual rm -> do
     let refqt = rmTable rm
         (lCols, rCols) = unzip $ HM.toList $ rmColumns rm
         mkDependency tableName reason col = SchemaDependency (SOTableObj tableName $ TOCol col) reason
@@ -115,7 +117,7 @@ arrRelP2Setup
   -> ArrRelDef
   -> m (RelInfo, [SchemaDependency])
 arrRelP2Setup foreignKeys qt (RelDef rn ru _) = case ru of
-  RUManual (ArrRelManualConfig rm) -> do
+  RUManual rm -> do
     let refqt = rmTable rm
         (lCols, rCols) = unzip $ HM.toList $ rmColumns rm
         deps  = map (\c -> SchemaDependency (SOTableObj qt $ TOCol c) DRLeftColumn) lCols

@@ -1,7 +1,4 @@
 {-# LANGUAGE QuasiQuotes            #-}
-{-# LANGUAGE RankNTypes             #-}
-{-# LANGUAGE TypeApplications       #-}
-{-# LANGUAGE TypeFamilies           #-}
 {-# LANGUAGE TypeFamilyDependencies #-}
 
 module Hasura.RQL.DDL.Permission.Internal where
@@ -23,6 +20,7 @@ import           Hasura.Prelude
 import           Hasura.RQL.GBoolExp
 import           Hasura.RQL.Types
 import           Hasura.Server.Utils
+import           Hasura.Session
 import           Hasura.SQL.Types
 import           Hasura.SQL.Value
 
@@ -180,7 +178,7 @@ getDepHeadersFromVal val = case val of
   where
     parseOnlyString v = case v of
       (String t)
-        | isUserVar t -> [T.toLower t]
+        | isSessionVariable t -> [T.toLower t]
         | isReqUserId t -> [userIdHeader]
         | otherwise -> []
       _ -> []
@@ -197,7 +195,7 @@ valueParser
 valueParser pgType = \case
   -- When it is a special variable
   String t
-    | isUserVar t   -> return $ mkTypedSessionVar pgType t
+    | isSessionVariable t   -> return $ mkTypedSessionVar pgType $ mkSessionVariable t
     | isReqUserId t -> return $ mkTypedSessionVar pgType userIdHeader
   -- Typical value as Aeson's value
   val -> case pgType of
@@ -239,8 +237,6 @@ type family PermInfo a = r | r -> a
 
 class (ToJSON a) => IsPerm a where
 
-  type DropPermP1Res a
-
   permAccessor
     :: PermAccessor (PermInfo a)
 
@@ -250,16 +246,6 @@ class (ToJSON a) => IsPerm a where
     -> FieldInfoMap FieldInfo
     -> PermDef a
     -> m (WithDeps (PermInfo a))
-
-  addPermP2Setup
-    :: (MonadTx m) => QualifiedTable -> PermDef a -> PermInfo a -> m ()
-
-  buildDropPermP1Res
-    :: (QErrM m, CacheRM m, UserInfoM m)
-    => DropPerm a
-    -> m (DropPermP1Res a)
-
-  dropPermP2Setup :: (MonadTx m) => DropPerm a -> DropPermP1Res a -> m ()
 
   getPermAcc1
     :: PermDef a -> PermAccessor (PermInfo a)
@@ -291,9 +277,8 @@ dropPermP1 dp@(DropPerm tn rn) = do
   tabInfo <- askTabInfo tn
   askPermInfo tabInfo rn $ getPermAcc2 dp
 
-dropPermP2 :: (MonadTx m, IsPerm a) => DropPerm a -> DropPermP1Res a -> m ()
-dropPermP2 dp@(DropPerm tn rn) p1Res = do
-  dropPermP2Setup dp p1Res
+dropPermP2 :: forall a m. (MonadTx m, IsPerm a) => DropPerm a -> m ()
+dropPermP2 dp@(DropPerm tn rn) =
   liftTx $ dropPermFromCatalog tn rn pt
   where
     pa = getPermAcc2 dp
@@ -303,7 +288,7 @@ runDropPerm
   :: (IsPerm a, UserInfoM m, CacheRWM m, MonadTx m)
   => DropPerm a -> m EncJSON
 runDropPerm defn = do
-  permInfo <- buildDropPermP1Res defn
-  dropPermP2 defn permInfo
+  dropPermP1 defn
+  dropPermP2 defn
   withNewInconsistentObjsCheck buildSchemaCache
   return successMsg

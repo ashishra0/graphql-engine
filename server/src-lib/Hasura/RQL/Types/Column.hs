@@ -12,9 +12,11 @@ module Hasura.RQL.Types.Column
   , parsePGScalarValue
   , parsePGScalarValues
   , unsafePGColumnToRepresentation
+  , parseTxtEncodedPGValue
 
   , PGColumnInfo(..)
   , PGRawColumnInfo(..)
+  , PrimaryKeyColumns
   , getColInfos
 
   , EnumReference(..)
@@ -33,6 +35,7 @@ import           Control.Lens.TH
 import           Data.Aeson
 import           Data.Aeson.Casing
 import           Data.Aeson.TH
+import           Data.Sequence.NonEmpty
 import           Language.Haskell.TH.Syntax    (Lift)
 
 import           Hasura.Incremental            (Cacheable)
@@ -113,7 +116,7 @@ parsePGScalarValue columnType value = case columnType of
       parseEnumValue :: Text -> m PGScalarValue
       parseEnumValue textValue = do
         let enumTextValues = map getEnumValue $ M.keys enumValues
-        unless (textValue `elem` enumTextValues) $ fail . T.unpack
+        unless (textValue `elem` enumTextValues) $ throw400 UnexpectedPayload
           $ "expected one of the values " <> T.intercalate ", " (map dquote enumTextValues)
           <> " for type " <> snakeCaseQualObject tableName <<> ", given " <>> textValue
         pure $ PGValText textValue
@@ -124,6 +127,15 @@ parsePGScalarValues
 parsePGScalarValues columnType values = do
   scalarValues <- indexedMapM (fmap pstValue . parsePGScalarValue columnType) values
   pure $ WithScalarType (unsafePGColumnToRepresentation columnType) scalarValues
+
+parseTxtEncodedPGValue
+  :: (MonadError QErr m)
+  => PGColumnType -> TxtEncodedPGVal -> m (WithScalarType PGScalarValue)
+parseTxtEncodedPGValue colTy val =
+  parsePGScalarValue colTy $ case val of
+    TENull  -> Null
+    TELit t -> String t
+
 
 -- | “Raw” column info, as stored in the catalog (but not in the schema cache). Instead of
 -- containing a 'PGColumnType', it only contains a 'PGScalarType', which is combined with the
@@ -150,13 +162,17 @@ data PGColumnInfo
   { pgiColumn      :: !PGCol
   , pgiName        :: !G.Name
   -- ^ field name exposed in GraphQL interface
+  , pgiPosition    :: !Int
   , pgiType        :: !PGColumnType
   , pgiIsNullable  :: !Bool
   , pgiDescription :: !(Maybe PGDescription)
   } deriving (Show, Eq, Generic)
 instance NFData PGColumnInfo
 instance Cacheable PGColumnInfo
+instance Hashable PGColumnInfo
 $(deriveToJSON (aesonDrop 3 snakeCase) ''PGColumnInfo)
+
+type PrimaryKeyColumns = NESeq PGColumnInfo
 
 onlyIntCols :: [PGColumnInfo] -> [PGColumnInfo]
 onlyIntCols = filter (isScalarColumnWhere isIntegerType . pgiType)

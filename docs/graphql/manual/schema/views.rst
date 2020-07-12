@@ -1,7 +1,11 @@
+.. meta::
+   :description: Customise the Hasura GraphQL schema with views
+   :keywords: hasura, docs, schema, view
+
 .. _custom_views:
 
-Customise schema with views
-===========================
+Extend schema with views
+========================
 
 .. contents:: Table of contents
   :backlinks: none
@@ -12,7 +16,7 @@ Customise schema with views
 What are views?
 ---------------
 
-`Views <https://www.postgresql.org/docs/current/sql-createview.html>`_ can be used to expose the results of a custom
+`Views <https://www.postgresql.org/docs/current/sql-createview.html>`__ can be used to expose the results of a custom
 query as a virtual table. Views are not persisted physically i.e. the query defining a view is executed whenever
 data is requested from the view.
 

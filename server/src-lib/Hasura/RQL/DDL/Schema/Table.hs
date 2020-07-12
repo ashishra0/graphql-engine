@@ -4,7 +4,6 @@
 module Hasura.RQL.DDL.Schema.Table
   ( TrackTable(..)
   , runTrackTableQ
-  , trackExistingTableOrViewP2
 
   , TrackTableV2(..)
   , runTrackTableV2Q
@@ -37,8 +36,8 @@ import           Hasura.Server.Utils
 import           Hasura.SQL.Types
 
 import qualified Database.PG.Query                  as Q
-import qualified Hasura.GraphQL.Context             as GC
 import qualified Hasura.GraphQL.Schema              as GS
+import qualified Hasura.GraphQL.Context             as GC
 import qualified Hasura.Incremental                 as Inc
 import qualified Language.GraphQL.Draft.Syntax      as G
 
@@ -101,13 +100,12 @@ trackExistingTableOrViewP1 qt = do
     throw400 NotSupported $ "function with name " <> qt <<> " already exists"
 
 trackExistingTableOrViewP2
-  :: (MonadTx m, CacheRWM m)
-  => QualifiedTable -> SystemDefined -> Bool -> TableConfig -> m EncJSON
-trackExistingTableOrViewP2 tableName systemDefined isEnum config = do
-  sc <- askSchemaCache
-  let defGCtx = scDefaultRemoteGCtx sc
-  GS.checkConflictingNode defGCtx $ GS.qualObjectToName tableName
-  saveTableToCatalog tableName systemDefined isEnum config
+  :: (MonadTx m, CacheRWM m, HasSystemDefined m)
+  => QualifiedTable -> Bool -> TableConfig -> m EncJSON
+trackExistingTableOrViewP2 tableName isEnum config = do
+  typeMap <- GC._gTypes . scDefaultRemoteGCtx <$> askSchemaCache
+  GS.checkConflictingNode typeMap $ GS.qualObjectToName tableName
+  saveTableToCatalog tableName isEnum config
   buildSchemaCacheFor (MOTable tableName)
   return successMsg
 
@@ -115,8 +113,7 @@ runTrackTableQ
   :: (MonadTx m, CacheRWM m, HasSystemDefined m) => TrackTable -> m EncJSON
 runTrackTableQ (TrackTable qt isEnum) = do
   trackExistingTableOrViewP1 qt
-  systemDefined <- askSystemDefined
-  trackExistingTableOrViewP2 qt systemDefined isEnum emptyTableConfig
+  trackExistingTableOrViewP2 qt isEnum emptyTableConfig
 
 data TrackTableV2
   = TrackTableV2
@@ -129,8 +126,7 @@ runTrackTableV2Q
   :: (MonadTx m, CacheRWM m, HasSystemDefined m) => TrackTableV2 -> m EncJSON
 runTrackTableV2Q (TrackTableV2 (TrackTable qt isEnum) config) = do
   trackExistingTableOrViewP1 qt
-  systemDefined <- askSystemDefined
-  trackExistingTableOrViewP2 qt systemDefined isEnum config
+  trackExistingTableOrViewP2 qt isEnum config
 
 runSetExistingTableIsEnumQ :: (MonadTx m, CacheRWM m) => SetTableIsEnum -> m EncJSON
 runSetExistingTableIsEnumQ (SetTableIsEnum tableName isEnum) = do
@@ -142,7 +138,7 @@ runSetExistingTableIsEnumQ (SetTableIsEnum tableName isEnum) = do
 data SetTableCustomFields
   = SetTableCustomFields
   { _stcfTable             :: !QualifiedTable
-  , _stcfCustomRootFields  :: !GC.TableCustomRootFields
+  , _stcfCustomRootFields  :: !TableCustomRootFields
   , _stcfCustomColumnNames :: !CustomColumnNames
   } deriving (Show, Eq, Lift)
 $(deriveToJSON (aesonDrop 5 snakeCase) ''SetTableCustomFields)
@@ -151,7 +147,7 @@ instance FromJSON SetTableCustomFields where
   parseJSON = withObject "SetTableCustomFields" $ \o ->
     SetTableCustomFields
     <$> o .: "table"
-    <*> o .:? "custom_root_fields" .!= GC.emptyCustomRootFields
+    <*> o .:? "custom_root_fields" .!= emptyCustomRootFields
     <*> o .:? "custom_column_names" .!= M.empty
 
 runSetTableCustomFieldsQV2
@@ -215,9 +211,9 @@ processTableChanges ti tableDiff = do
 
       withNewTabName newTN = do
         let tnGQL = GS.qualObjectToName newTN
-            defGCtx = scDefaultRemoteGCtx sc
+            typeMap = GC._gTypes $ scDefaultRemoteGCtx sc
         -- check for GraphQL schema conflicts on new name
-        GS.checkConflictingNode defGCtx tnGQL
+        GS.checkConflictingNode typeMap tnGQL
         procAlteredCols sc tn
         -- update new table in catalog
         renameTableInCatalog newTN tn
@@ -285,6 +281,10 @@ delTableAndDirectDeps qtn@(QualifiedObject sn tn) = do
              DELETE FROM "hdb_catalog"."hdb_computed_field"
              WHERE table_schema = $1 AND table_name = $2
               |] (sn, tn) False
+    Q.unitQ [Q.sql|
+             DELETE FROM "hdb_catalog"."hdb_remote_relationship"
+             WHERE table_schema = $1 AND table_name = $2
+              |] (sn, tn) False
   deleteTableFromCatalog qtn
 
 -- | Builds an initial @'TableCache' 'PGColumnInfo'@ from catalog information. Does not fill in
@@ -294,10 +294,14 @@ buildTableCache
   :: forall arr m
    . ( ArrowChoice arr, Inc.ArrowDistribute arr, ArrowWriter (Seq CollectedInfo) arr
      , Inc.ArrowCache m arr, MonadTx m )
-  => [CatalogTable] `arr` M.HashMap QualifiedTable TableRawInfo
-buildTableCache = Inc.cache proc catalogTables -> do
+  => ( [CatalogTable]
+     , Inc.Dependency Inc.InvalidationKey
+     ) `arr` M.HashMap QualifiedTable TableRawInfo
+buildTableCache = Inc.cache proc (catalogTables, reloadMetadataInvalidationKey) -> do
   rawTableInfos <-
-    (| Inc.keyed (| withTable (\tables -> buildRawTableInfo <<< noDuplicateTables -< tables) |)
+    (| Inc.keyed (| withTable (\tables
+         -> (tables, reloadMetadataInvalidationKey)
+         >- first noDuplicateTables >>> buildRawTableInfo) |)
     |) (M.groupOnNE _ctName catalogTables)
   let rawTableCache = M.catMaybes rawTableInfos
       enumTables = flip M.mapMaybe rawTableCache \rawTableInfo ->
@@ -316,8 +320,13 @@ buildTableCache = Inc.cache proc catalogTables -> do
       _           -> throwA -< err400 AlreadyExists "duplication definition for table"
 
     -- Step 1: Build the raw table cache from metadata information.
-    buildRawTableInfo :: ErrorA QErr arr CatalogTable (TableCoreInfoG PGRawColumnInfo PGCol)
-    buildRawTableInfo = Inc.cache proc (CatalogTable name systemDefined isEnum config maybeInfo) -> do
+    buildRawTableInfo
+      :: ErrorA QErr arr
+       ( CatalogTable
+       , Inc.Dependency Inc.InvalidationKey
+       ) (TableCoreInfoG PGRawColumnInfo PGCol)
+    buildRawTableInfo = Inc.cache proc (catalogTable, reloadMetadataInvalidationKey) -> do
+      let CatalogTable name systemDefined isEnum config maybeInfo = catalogTable
       catalogInfo <-
         (| onNothingA (throwA -<
              err400 NotExists $ "no such table/view exists in postgres: " <>> name)
@@ -328,7 +337,11 @@ buildTableCache = Inc.cache proc catalogTables -> do
           primaryKey = _ctiPrimaryKey catalogInfo
       rawPrimaryKey <- liftEitherA -< traverse (resolvePrimaryKeyColumns columnMap) primaryKey
       enumValues <- if isEnum
-        then bindErrorA -< Just <$> fetchAndValidateEnumValues name rawPrimaryKey columns
+        then do
+          -- We want to make sure we reload enum values whenever someone explicitly calls
+          -- `reload_metadata`.
+          Inc.dependOn -< reloadMetadataInvalidationKey
+          bindErrorA -< Just <$> fetchAndValidateEnumValues name rawPrimaryKey columns
         else returnA -< Nothing
 
       returnA -< TableCoreInfo
@@ -397,6 +410,7 @@ buildTableCache = Inc.cache proc catalogTables -> do
       pure PGColumnInfo
         { pgiColumn = pgCol
         , pgiName = name
+        , pgiPosition = prciPosition rawInfo
         , pgiType = resolvedType
         , pgiIsNullable = prciIsNullable rawInfo
         , pgiDescription = prciDescription rawInfo

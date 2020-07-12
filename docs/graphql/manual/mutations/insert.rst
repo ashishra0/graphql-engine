@@ -1,3 +1,9 @@
+.. meta::
+   :description: Insert an object into the database using a mutation
+   :keywords: hasura, docs, mutation, insert
+
+.. _insert:
+
 Insert mutation
 ===============
 
@@ -22,15 +28,22 @@ Auto-generated insert mutation schema
   type article_mutation_response {
     # number of affected rows by the mutation
     affected_rows: Int!
-    #data of the affected rows by the mutation
+    # data of the affected rows by the mutation
     returning: [article!]!
   }
+
+  # single object insert (supported from v1.2.0)
+  insert_article_one (
+    object: article_insert_input!
+    on_conflict: article_on_conflict
+  ): article
 
 As you can see from the schema:
 
 - ``objects`` argument is necessary and you can pass multiple ``objects`` to the mutation.
-- You can pass an ``on_conflict`` argument to convert the mutation to an :doc:`upsert mutation <upsert>`.
+- You can pass an ``on_conflict`` argument to convert the mutation to an :ref:`upsert mutation <upsert>`.
 - You can return the number of affected rows and the affected objects (with nested objects) in the response.
+- You can use the single object insert to get the inserted object directly as the mutation response.
 
 See the :ref:`insert mutation API reference <insert_upsert_syntax>` for the full specifications.
 
@@ -46,34 +59,24 @@ Insert a single object
 .. graphiql::
   :view_only:
   :query:
-    mutation insert_article {
-      insert_article(
-        objects: [
-          {
-            id: 21,
-            title: "Article 1",
-            content: "Sample article content",
-            author_id: 3
-          }
-        ]
-      ) {
-        returning {
-          id
-          title
+    mutation insert_single_article {
+      insert_article_one(
+        object: {
+          title: "Article 1",
+          content: "Sample article content",
+          author_id: 3
         }
+      ) {
+        id
+        title
       }
     }
   :response:
     {
       "data": {
-        "insert_article": {
-          "affected_rows": 1,
-          "returning": [
-            {
-              "id": 21,
-              "title": "Article 1"
-            }
-          ]
+        "insert_article_one": {
+          "id": 21,
+          "title": "Article 1"
         }
       }
     }
@@ -83,39 +86,38 @@ Using variables:
 .. graphiql::
   :view_only:
   :query:
-    mutation insert_article($objects: [article_insert_input!]! ) {
-      insert_article(objects: $objects) {
-        returning {
-          id
-          title
-        }
+    mutation insert_single_article($object: article_insert_input! ) {
+      insert_article_one(object: $object) {
+        id
+        title
       }
     }
   :response:
     {
       "data": {
-        "insert_article": {
-          "affected_rows": 1,
-          "returning": [
-            {
-              "id": 21,
-              "title": "Article 1"
-            }
-          ]
+        "insert_article_one": {
+          "id": 21,
+          "title": "Article 1"
         }
       }
     }
   :variables:
     {
-      "objects": [
-        {
-          "id": 21,
-          "title": "Article 1",
-          "content": "Sample article content",
-          "author_id": 3
-        }
-      ]
+      "object": {
+        "title": "Article 1",
+        "content": "Sample article content",
+        "author_id": 3
+      }
     }
+
+.. note:: 
+
+   ``insert_<object>_one`` will **only** be available if you have select permissions on the table, as it returns the inserted row.
+
+.. admonition:: Supported from
+
+   The ``insert_<object>_one`` mutation is supported in versions ``v1.2.0``
+   and above.
 
 Insert multiple objects of the same type in the same mutation
 -------------------------------------------------------------
@@ -124,17 +126,15 @@ Insert multiple objects of the same type in the same mutation
 .. graphiql::
   :view_only:
   :query:
-    mutation insert_article {
+    mutation insert_multiple_articles {
       insert_article(
         objects: [
           {
-            id: 22,
             title: "Article 2",
             content: "Sample article content",
             author_id: 4
           },
           {
-            id: 23,
             title: "Article 3",
             content: "Sample article content",
             author_id: 5
@@ -166,6 +166,54 @@ Insert multiple objects of the same type in the same mutation
       }
     }
 
+Using variables:
+
+.. graphiql::
+  :view_only:
+  :query:
+    mutation insert_multiple_articles($objects: [article_insert_input!]! ) {
+      insert_article(objects: $objects) {
+        returning {
+          id
+          title
+        }
+      }
+    }
+  :response:
+    {
+        "data": {
+          "insert_article": {
+            "affected_rows": 2,
+            "returning": [
+              {
+                "id": 22,
+                "title": "Article 2"
+              },
+              {
+                "id": 23,
+                "title": "Article 3"
+              }
+            ]
+          }
+        }
+      }
+  :variables:
+    {
+      "objects": [
+        {
+          "title": "Article 2",
+          "content": "Sample article content",
+          "author_id": 4
+        },
+        {
+          "title": "Article 3",
+          "content": "Sample article content",
+          "author_id": 5
+        }
+      ]
+    }
+
+
 Insert an object and get a nested object in response
 ----------------------------------------------------
 **Example:** Insert a new ``article`` object and return the inserted article object with its author in the response:
@@ -177,7 +225,6 @@ Insert an object and get a nested object in response
       insert_article(
         objects: [
           {
-            id: 21,
             title: "Article 1",
             content: "Sample article content",
             author_id: 3
@@ -233,23 +280,19 @@ Let's say an ``author`` has an ``object relationship`` called ``address`` to the
       insert_authors
         (objects: [
           {
-            id: 26,
             name: "John",
             address: {
               data: {
-                id: 27,
                 location: "San Francisco"
               }
             },
             articles: {
               data: [
                 {
-                  id: 28,
                   title: "GraphQL Guide",
                   content: "Let's see what we can do with GraphQL"
                 },
                 {
-                  id: 29,
                   title: "Authentication Guide",
                   content: "Let's look at best practices for authentication"
                 }
@@ -337,7 +380,6 @@ a bridge table ``article_tags``.
     mutation insertArticle {
       insert_articles(objects: [
         {
-          id: 34,
           title: "How to make fajitas",
           content: "Guide on making the best fajitas in the world",
           author_id: 3,
@@ -447,7 +489,6 @@ Insert an object with a JSONB field
       insert_author (
         objects: [
           {
-            id: 1,
             name: "Ash",
             address: $address
           }
@@ -496,7 +537,7 @@ Insert an object with a JSONB field
 Insert an object with an ARRAY field
 ------------------------------------
 
-To insert fields of array types, you currently have to pass them as a `Postgres array literal <https://www.postgresql.org/docs/current/arrays.html#ARRAYS-INPUT>`_.
+To insert fields of array types, you currently have to pass them as a `Postgres array literal <https://www.postgresql.org/docs/current/arrays.html#ARRAYS-INPUT>`__.
 
 **Example:** Insert a new ``author`` with a text array ``emails`` field:
 
@@ -507,7 +548,6 @@ To insert fields of array types, you currently have to pass them as a `Postgres 
       insert_author (
         objects: [
           {
-            id: 1,
             name: "Ash",
             emails: "{ash@ash.com, ash123@ash.com}"
           }
@@ -547,7 +587,6 @@ Using variables:
       insert_author (
         objects: [
           {
-            id: 1,
             name: "Ash",
             emails: $emails
           }
@@ -585,7 +624,7 @@ Set a field to its default value during insert
 ----------------------------------------------
 
 To set a field to its ``default`` value, just omit it from the input object, irrespective of the
-:doc:`default value configuration <../schema/default-values/index>` i.e. via Postgres defaults or using column presets.
+:ref:`default value configuration <postgres_defaults>` i.e. via Postgres defaults or using column presets.
 
 **Example:** If the default value of ``id`` is set to auto-incrementing integer, there's no need to pass the ``id`` field to the input object:
 

@@ -1,7 +1,7 @@
 import React from 'react';
-
 import { getIntrospectionQuery, buildClientSchema } from 'graphql';
 import GraphiQLExplorer from 'graphiql-explorer';
+import { setLoading } from '../Actions';
 
 import {
   makeDefaultArg,
@@ -17,6 +17,7 @@ import { getHeadersAsJSON } from '../utils';
 
 import '../GraphiQLWrapper/GraphiQL.css';
 import './OneGraphExplorer.css';
+import { showErrorNotification } from '../../Common/Notification';
 
 class OneGraphExplorer extends React.Component {
   state = {
@@ -26,7 +27,6 @@ class OneGraphExplorer extends React.Component {
     schema: null,
     query: undefined,
     isResizing: false,
-    loading: false,
     previousIntrospectionHeaders: [],
   };
 
@@ -35,11 +35,17 @@ class OneGraphExplorer extends React.Component {
     this.introspect();
   }
 
-  componentDidUpdate() {
-    if (!this.props.headerFocus && !this.state.loading) {
+  componentDidUpdate(prevProps) {
+    const { headerFocus, headers, loading } = this.props;
+    const { previousIntrospectionHeaders } = this.state;
+    // always introspect if mode changes
+    if (this.props.mode !== prevProps.mode) {
+      this.introspect();
+      return;
+    }
+    if (!headerFocus && !loading) {
       if (
-        JSON.stringify(this.props.headers) !==
-        JSON.stringify(this.state.previousIntrospectionHeaders)
+        JSON.stringify(headers) !== JSON.stringify(previousIntrospectionHeaders)
       ) {
         this.introspect();
       }
@@ -78,12 +84,18 @@ class OneGraphExplorer extends React.Component {
   }
 
   introspect() {
-    const { endpoint, headersInitialised } = this.props;
+    const {
+      endpoint,
+      headersInitialised,
+      headers: headers_,
+      dispatch,
+    } = this.props;
     if (!headersInitialised) {
       return;
     }
-    const headers = JSON.parse(JSON.stringify(this.props.headers));
-    this.setState({ loading: true });
+    const headers = JSON.parse(JSON.stringify(headers_));
+    dispatch(setLoading(true));
+    this.setState({ schema: null });
     fetch(endpoint, {
       method: 'POST',
       headers: getHeadersAsJSON(headers || []),
@@ -93,18 +105,33 @@ class OneGraphExplorer extends React.Component {
     })
       .then(response => response.json())
       .then(result => {
+        if (result.errors && result.errors.length > 0) {
+          const errorMessage = result.errors[0].message;
+          dispatch(
+            showErrorNotification(
+              'Schema introspection query failed',
+              errorMessage
+            )
+          );
+          this.setState({
+            schema: null,
+            previousIntrospectionHeaders: headers,
+          });
+          return;
+        }
         this.setState({
           schema: buildClientSchema(result.data),
-          loading: false,
           previousIntrospectionHeaders: headers,
         });
       })
       .catch(() => {
         this.setState({
           schema: null,
-          loading: false,
           previousIntrospectionHeaders: headers,
         });
+      })
+      .finally(() => {
+        dispatch(setLoading(false));
       });
   }
 

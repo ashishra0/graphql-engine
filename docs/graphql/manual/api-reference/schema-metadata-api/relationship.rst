@@ -1,3 +1,9 @@
+.. meta::
+   :description: Use relationships with the Hasura schema/metadata API
+   :keywords: hasura, docs, schema/metadata API, API reference, relationship
+
+.. _api_relationship:
+
 Schema/Metadata API Reference: Relationships
 ============================================
 
@@ -354,7 +360,7 @@ drop_relationship
 
 ``drop_relationship`` is used to drop a relationship (both object and array) on
 a table. If there are other objects dependent on this relationship like
-permissions and query templates, etc., the query will fail and report the dependencies
+permissions and query templates, etc., the request will fail and report the dependencies
 unless ``cascade`` is set to ``true``. If ``cascade`` is set to ``true``, the
 dependent objects are also dropped. 
 
@@ -401,7 +407,7 @@ Args syntax
 
 .. note::
 
-   Be careful when using ``cascade``. First, try running the query without
+   Be careful when using ``cascade``. First, try running the request without
    ``cascade`` or ``cascade`` set to ``false``.
 
 .. _set_relationship_comment:

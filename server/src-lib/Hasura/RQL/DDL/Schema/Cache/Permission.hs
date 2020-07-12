@@ -21,11 +21,12 @@ import           Hasura.RQL.DDL.Permission.Internal
 import           Hasura.RQL.DDL.Schema.Cache.Common
 import           Hasura.RQL.Types
 import           Hasura.RQL.Types.Catalog
+import           Hasura.Session
 import           Hasura.SQL.Types
 
 buildTablePermissions
   :: ( ArrowChoice arr, Inc.ArrowDistribute arr, Inc.ArrowCache m arr
-     , ArrowWriter (Seq CollectedInfo) arr, MonadTx m, MonadReader BuildReason m )
+     , ArrowWriter (Seq CollectedInfo) arr, MonadTx m )
   => ( Inc.Dependency TableCoreCache
      , QualifiedTable
      , FieldInfoMap FieldInfo
@@ -80,8 +81,9 @@ withPermission f = proc (e, (permission, s)) -> do
 
 buildPermission
   :: ( ArrowChoice arr, Inc.ArrowCache m arr
-     , ArrowWriter (Seq CollectedInfo) arr, MonadTx m, MonadReader BuildReason m
-     , Inc.Cacheable a, IsPerm a, FromJSON a, Inc.Cacheable (PermInfo a) )
+     , ArrowWriter (Seq CollectedInfo) arr
+     , MonadTx m, IsPerm a, FromJSON a
+     )
   => ( Inc.Dependency TableCoreCache
      , QualifiedTable
      , FieldInfoMap FieldInfo
@@ -91,23 +93,13 @@ buildPermission = Inc.cache proc (tableCache, tableName, tableFields, permission
       (permissions >- noDuplicates mkPermissionMetadataObject)
   >-> (| traverseA (\permission@(CatalogPermission _ roleName _ pDef _) ->
          (| withPermission (do
-              bindErrorA -< when (roleName == adminRole) $
+              bindErrorA -< when (roleName == adminRoleName) $
                 throw400 ConstraintViolation "cannot define permission for admin role"
               perm <- bindErrorA -< decodeValue pDef
               let permDef = PermDef roleName perm Nothing
               (info, dependencies) <- liftEitherA <<< Inc.bindDepend -< runExceptT $
                 runTableCoreCacheRT (buildPermInfo tableName tableFields permDef) tableCache
               tellA -< Seq.fromList dependencies
-              rebuildViewsIfNeeded -< (tableName, permDef, info)
               returnA -< info)
          |) permission) |)
   >-> (\info -> join info >- returnA)
-
-rebuildViewsIfNeeded
-  :: ( Inc.ArrowCache m arr, MonadTx m, MonadReader BuildReason m
-     , Inc.Cacheable a, IsPerm a, Inc.Cacheable (PermInfo a) )
-  => (QualifiedTable, PermDef a, PermInfo a) `arr` ()
-rebuildViewsIfNeeded = Inc.cache $ arrM \(tableName, permDef, info) -> do
-  buildReason <- ask
-  when (buildReason == CatalogUpdate) $
-    addPermP2Setup tableName permDef info

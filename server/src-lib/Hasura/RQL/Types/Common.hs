@@ -21,38 +21,54 @@ module Hasura.RQL.Types.Common
        , pkConstraint
        , pkColumns
        , ForeignKey(..)
+       , EquatableGType(..)
+       , InpValInfo(..)
        , CustomColumnNames
 
        , NonEmptyText
+       , mkNonEmptyTextUnsafe
        , mkNonEmptyText
        , unNonEmptyText
+       , nonEmptyText
        , adminText
        , rootText
 
        , SystemDefined(..)
        , isSystemDefined
+
+       , successMsg
+       , NonNegativeDiffTime(..)
+       , InputWebhook(..)
+       , ResolvedWebhook(..)
+       , resolveWebhook
        ) where
 
+import           Hasura.EncJSON
 import           Hasura.Incremental            (Cacheable)
 import           Hasura.Prelude
+import           Hasura.RQL.DDL.Headers        ()
+import           Hasura.RQL.Types.Error
 import           Hasura.SQL.Types
+
 
 import           Control.Lens                  (makeLenses)
 import           Data.Aeson
 import           Data.Aeson.Casing
 import           Data.Aeson.TH
-import           Data.Aeson.Types
+import           Data.Sequence.NonEmpty
+import           Data.URL.Template
 import           Instances.TH.Lift             ()
-import           Language.Haskell.TH.Syntax    (Lift)
+import           Language.Haskell.TH.Syntax    (Lift, Q, TExp)
 
 import qualified Data.HashMap.Strict           as HM
 import qualified Data.Text                     as T
 import qualified Database.PG.Query             as Q
 import qualified Language.GraphQL.Draft.Syntax as G
+import qualified Language.Haskell.TH.Syntax    as TH
 import qualified PostgreSQL.Binary.Decoding    as PD
 import qualified Test.QuickCheck               as QC
 
-newtype NonEmptyText = NonEmptyText {unNonEmptyText :: T.Text}
+newtype NonEmptyText = NonEmptyText { unNonEmptyText :: T.Text }
   deriving (Show, Eq, Ord, Hashable, ToJSON, ToJSONKey, Lift, Q.ToPrepArg, DQuote, Generic, NFData, Cacheable)
 
 instance Arbitrary NonEmptyText where
@@ -62,10 +78,16 @@ mkNonEmptyText :: T.Text -> Maybe NonEmptyText
 mkNonEmptyText ""   = Nothing
 mkNonEmptyText text = Just $ NonEmptyText text
 
-parseNonEmptyText :: T.Text -> Parser NonEmptyText
+mkNonEmptyTextUnsafe :: T.Text -> NonEmptyText
+mkNonEmptyTextUnsafe = NonEmptyText
+
+parseNonEmptyText :: MonadFail m => Text -> m NonEmptyText
 parseNonEmptyText text = case mkNonEmptyText text of
   Nothing     -> fail "empty string not allowed"
   Just neText -> return neText
+
+nonEmptyText :: Text -> Q (TExp NonEmptyText)
+nonEmptyText = parseNonEmptyText >=> \text -> [|| text ||]
 
 instance FromJSON NonEmptyText where
   parseJSON = withText "String" parseNonEmptyText
@@ -106,7 +128,7 @@ relTypeToTxt ArrRel = "array"
 data RelType
   = ObjRel
   | ArrRel
-  deriving (Show, Eq, Generic)
+  deriving (Show, Eq, Lift, Generic)
 instance NFData RelType
 instance Hashable RelType
 instance Cacheable RelType
@@ -135,11 +157,16 @@ data RelInfo
   } deriving (Show, Eq, Generic)
 instance NFData RelInfo
 instance Cacheable RelInfo
+instance Hashable RelInfo
 $(deriveToJSON (aesonDrop 2 snakeCase) ''RelInfo)
 
 newtype FieldName
   = FieldName { getFieldNameTxt :: T.Text }
-  deriving (Show, Eq, Ord, Hashable, FromJSON, ToJSON, FromJSONKey, ToJSONKey, Lift, Data, Generic, Arbitrary, NFData, Cacheable)
+  deriving ( Show, Eq, Ord, Hashable, FromJSON, ToJSON
+           , FromJSONKey, ToJSONKey, Lift, Data, Generic
+           , IsString, Arbitrary, NFData, Cacheable
+           , Semigroup
+           )
 
 instance IsIden FieldName where
   toIden (FieldName f) = Iden f
@@ -200,8 +227,8 @@ $(deriveJSON (aesonDrop 2 snakeCase) ''Constraint)
 data PrimaryKey a
   = PrimaryKey
   { _pkConstraint :: !Constraint
-  , _pkColumns    :: !(NonEmpty a)
-  } deriving (Show, Eq, Generic)
+  , _pkColumns    :: !(NESeq a)
+  } deriving (Show, Eq, Generic, Foldable)
 instance (NFData a) => NFData (PrimaryKey a)
 instance (Cacheable a) => Cacheable (PrimaryKey a)
 $(makeLenses ''PrimaryKey)
@@ -218,6 +245,24 @@ instance Hashable ForeignKey
 instance Cacheable ForeignKey
 $(deriveJSON (aesonDrop 3 snakeCase) ''ForeignKey)
 
+data InpValInfo
+  = InpValInfo
+  { _iviDesc   :: !(Maybe G.Description)
+  , _iviName   :: !G.Name
+  , _iviDefVal :: !(Maybe G.ValueConst)
+  , _iviType   :: !G.GType
+  } deriving (Show, Eq, TH.Lift, Generic)
+instance Cacheable InpValInfo
+
+instance EquatableGType InpValInfo where
+  type EqProps InpValInfo = (G.Name, G.GType)
+  getEqProps ity = (,) (_iviName ity) (_iviType ity)
+
+-- | Typeclass for equating relevant properties of various GraphQL types defined below
+class EquatableGType a where
+  type EqProps a
+  getEqProps :: a -> EqProps a
+
 type CustomColumnNames = HM.HashMap PGCol G.Name
 
 newtype SystemDefined = SystemDefined { unSystemDefined :: Bool }
@@ -225,3 +270,40 @@ newtype SystemDefined = SystemDefined { unSystemDefined :: Bool }
 
 isSystemDefined :: SystemDefined -> Bool
 isSystemDefined = unSystemDefined
+
+successMsg :: EncJSON
+successMsg = "{\"message\":\"success\"}"
+
+newtype NonNegativeDiffTime = NonNegativeDiffTime { unNonNegativeDiffTime :: DiffTime }
+  deriving (Show, Eq,ToJSON,Generic, NFData, Cacheable)
+
+instance FromJSON NonNegativeDiffTime where
+  parseJSON = withScientific "NonNegativeDiffTime" $ \t -> do
+    case (t > 0) of
+      True  -> return $ NonNegativeDiffTime . realToFrac $ t
+      False -> fail "negative value not allowed"
+
+newtype ResolvedWebhook
+  = ResolvedWebhook { unResolvedWebhook :: Text}
+  deriving ( Show, Eq, FromJSON, ToJSON, Hashable, DQuote, Lift)
+
+newtype InputWebhook
+  = InputWebhook {unInputWebhook :: URLTemplate}
+  deriving (Show, Eq, Lift, Generic)
+instance NFData InputWebhook
+instance Cacheable InputWebhook
+
+instance ToJSON InputWebhook where
+  toJSON =  String . printURLTemplate . unInputWebhook
+
+instance FromJSON InputWebhook where
+  parseJSON = withText "String" $ \t ->
+    case parseURLTemplate t of
+      Left e  -> fail $ "Parsing URL template failed: " ++ e
+      Right v -> pure $ InputWebhook v
+
+resolveWebhook :: (QErrM m,MonadIO m) => InputWebhook -> m ResolvedWebhook
+resolveWebhook (InputWebhook urlTemplate) = do
+  eitherRenderedTemplate <- renderURLTemplate urlTemplate
+  either (throw400 Unexpected . T.pack)
+    (pure . ResolvedWebhook) eitherRenderedTemplate

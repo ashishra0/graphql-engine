@@ -1,4 +1,8 @@
-.. _production-checklist:
+.. meta::
+   :description: Checklist for deploying Hasura GraphQL engine to production
+   :keywords: hasura, docs, deployment, production, checklist
+
+.. _production_checklist:
 
 Production checklist
 ====================
@@ -25,7 +29,7 @@ recommended to keep this as a long string.
    # or use the flag
    graphql-engine --database-url=<database-url> serve --admin-secret=averylongpasswordstring
 
-More details can be found at :ref:`securing-graphql-endpoint`.
+More details can be found at :ref:`securing_graphql_endpoint`.
 
 Verify permissions
 ------------------
@@ -42,7 +46,7 @@ Review the authorization/permission rules set on tables. You can make use of the
 permissions set across all tables and roles. Pay extra attention to roles like
 "anonymous" which allow unauthenticated access.
 
-.. thumbnail:: ../../../img/graphql/manual/deployment/schema_permissions_summary.png
+.. thumbnail:: /img/graphql/manual/deployment/schema_permissions_summary.png
    :alt: Hasura console - Schema permissions summary
    :width: 75%
 
@@ -71,10 +75,10 @@ In most production scenarios, you would only need GraphQL API to be enabled.
    graphql-engine --database-url=<database-url> serve --enabled-apis=graphql
 
 By setting the above flag or env var, we are disabling the ``metadata``,
-``pg_dump`` and ``config`` APIs. ``health`` and ``version`` APIs are public and
+``pgdump`` and ``config`` APIs. ``health`` and ``version`` APIs are public and
 cannot be disabled.
 
-Read more about all the API types at the :ref:`API reference <api-reference>`.
+Read more about all the API types at the :ref:`API reference <api_reference>`.
 
 .. note::
 
@@ -89,9 +93,11 @@ Disable console
 It is recommended that you disable the console on production deployments. Also,
 when you disable the metadata API, console will stop working.
 
+The console is disabled by default.
+
 .. code-block:: bash
 
-   # set the env var to disable console
+   # set the env var to false or do not set it at all to disable console
    HASURA_GRAPHQL_ENABLE_CONSOLE=false
 
    # when using flags, no --enable-console flag implies console is disabled
@@ -102,6 +108,24 @@ when you disable the metadata API, console will stop working.
    You can still use the CLI to open a console connected to this instance.
    (Provided ``metadata`` APIs are not disabled).
 
+Disable dev mode
+----------------
+
+It is recommended that you disable the :ref:`dev mode <dev-mode>` on production
+deployments for non-admin roles to avoid leaking internal debugging information
+to the clients in case of API errors.
+
+The dev mode is disabled by default.
+
+.. code-block:: bash
+
+   # set the env var to false or do not set it at all to disable dev mode
+   HASURA_GRAPHQL_DEV_MODE=false
+
+   # when using flags, no --dev-mode flag implies dev mode is disabled
+   graphql-engine --database-url=<database-url> serve
+
+
 Set up an allow-list
 --------------------
 
@@ -110,7 +134,7 @@ this particular instance. If your API is meant to serve a frontend client, you
 can only allow those requests used by the client to pass through. Every other
 request will be rejected without even getting validated.
 
-Read more at :ref:`allow-list`.
+Read more at :ref:`allow_list`.
 
 Restrict CORS domains
 ---------------------
@@ -133,7 +157,7 @@ Enable HTTPS
 
 Production APIs should be served over HTTPS to be secure over the network.
 
-See :ref:`enable-https` for details on achieving this.
+See :ref:`enable_https` for details on achieving this.
 
 Configure logging
 -----------------

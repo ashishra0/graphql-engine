@@ -1,3 +1,9 @@
+.. meta::
+   :description: Use variables, aliases, fragments and directives in Hasura queries
+   :keywords: hasura, docs, query, variable, alias, fragment, directive
+
+.. _variables_aliases_fragments_directives:
+
 Using variables / aliases / fragments / directives in queries
 =============================================================
 
@@ -43,6 +49,10 @@ In order to make a query re-usable, it can be made dynamic by using variables.
     {
       "author_id": 1
     }
+
+.. admonition:: Variables and performance
+
+  Variables have an impact on query performance. Refer to :ref:`query performance <query_performance>` to learn more about Hasura's query plan caching and about optimizing when using variables.
 
 Using aliases
 -------------

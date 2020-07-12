@@ -72,7 +72,7 @@ The contributing guide for docs can be found at [docs/CONTRIBUTING.md](docs/CONT
 
 ### Community content
 
-Since we launched our [learn page](https://learn.hasura.io/), we are happy about contributions:
+Since we launched our [learn page](https://hasura.io/learn/), we are happy about contributions:
 
 - Fix errors in existing learn tutorials
 
@@ -120,6 +120,8 @@ The README of the CLI repository can be found [here](https://github.com/hasura/g
 - Please include logs of the server, if relevant.
 
 ### Working on an issue
+
+- We use the [fork-and-branch git workflow](https://blog.scottlowe.org/2015/01/27/using-fork-branch-git-workflow/).
 
 - Please make sure there is an issue associated with the work that you're doing.
 

@@ -1,3 +1,4 @@
+-- | See: https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md
 module Hasura.GraphQL.Transport.WebSocket.Protocol
   ( OperationId(..)
   , ConnParams(..)
@@ -5,6 +6,7 @@ module Hasura.GraphQL.Transport.WebSocket.Protocol
   , StopMsg(..)
   , ClientMsg(..)
   , ServerMsg(..)
+  , ServerMsgType(..)
   , encodeServerMsg
   , DataMsg(..)
   , ErrorMsg(..)
@@ -22,6 +24,7 @@ import           Hasura.EncJSON
 import           Hasura.GraphQL.Transport.HTTP.Protocol
 import           Hasura.Prelude
 
+-- | These come from the client and are websocket connection-local.
 newtype OperationId
   = OperationId { unOperationId :: Text }
   deriving (Show, Eq, J.ToJSON, J.FromJSON, Hashable)

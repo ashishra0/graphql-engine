@@ -1,3 +1,9 @@
+.. meta::
+   :description: Set default field values using Postgres defaults
+   :keywords: hasura, docs, schema, default value, Postgres default
+
+.. _postgres_defaults:
+
 Setting default values for fields using Postgres defaults
 =========================================================
 
@@ -24,7 +30,7 @@ Edit the ``created_at`` field and set its default value as the SQL function ``no
 
 Open the console and head to ``Data -> article -> Modify``:
 
-.. thumbnail:: ../../../../img/graphql/manual/schema/add-default-value.png
+.. thumbnail:: /img/graphql/manual/schema/add-default-value.png
    :alt: Modify the table in the console
 
 .. admonition:: To set an auto-incrementing default value
@@ -50,11 +56,41 @@ Step 2: Run an insert mutation
 Now if you do not pass the ``created_at`` field value while running an insert mutation on the ``article`` table, its
 value will be set automatically by Postgres.
 
-.. thumbnail:: ../../../../img/graphql/manual/schema/default-value-response.png
-   :alt: Run an insert mutation
+.. graphiql::
+  :view_only:
+  :query:
+    mutation {
+      insert_article(
+        objects: [
+          {
+            title: "GraphQL manual",
+            author_id: 11
+          }
+        ]) {
+        returning {
+          id
+          title
+          created_at
+        }
+      }
+    }
+  :response:
+    {
+      "data": {
+        "insert_article": {
+          "returning": [
+            {
+              "id": 12,
+              "title": "GraphQL manual",
+              "created_at": "2020-04-23T11:42:30.499315+00:00"
+            }
+          ]
+        }
+      }
+    }
 
 Also see
 --------
 
-- :doc:`sql-functions`
-- :doc:`column-presets`
+- :ref:`sql_functions_as_default`
+- :ref:`column_presets`

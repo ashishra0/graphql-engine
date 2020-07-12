@@ -4,6 +4,7 @@ module Hasura.RQL.DDL.Schema.Cache.Fields
   ( addNonColumnFields
   , mkRelationshipMetadataObject
   , mkComputedFieldMetadataObject
+  , mkRemoteRelationshipMetadataObject
   ) where
 import           Hasura.Prelude
 
@@ -11,6 +12,7 @@ import qualified Data.HashMap.Strict.Extended       as M
 import qualified Data.HashSet                       as HS
 import qualified Data.Sequence                      as Seq
 import qualified Language.GraphQL.Draft.Syntax      as G
+import qualified Hasura.GraphQL.Validate.Types      as VT
 
 import           Control.Arrow.Extended
 import           Data.Aeson
@@ -19,6 +21,7 @@ import qualified Hasura.Incremental                 as Inc
 
 import           Hasura.RQL.DDL.ComputedField
 import           Hasura.RQL.DDL.Relationship
+import           Hasura.RQL.DDL.RemoteRelationship
 import           Hasura.RQL.DDL.Schema.Cache.Common
 import           Hasura.RQL.DDL.Schema.Function
 import           Hasura.RQL.Types
@@ -30,40 +33,39 @@ addNonColumnFields
      , ArrowKleisli m arr, MonadError QErr m )
   => ( HashMap QualifiedTable TableRawInfo
      , FieldInfoMap PGColumnInfo
+     , RemoteSchemaMap
      , [CatalogRelation]
      , [CatalogComputedField]
-     ) `arr` FieldInfoMap FieldInfo
-addNonColumnFields = proc (rawTableInfo, columns, relationships, computedFields) -> do
-  let foreignKeys = _tciForeignKeys <$> rawTableInfo
-  relationshipInfos <-
-    (| Inc.keyed (\_ relationshipsByName -> do
-         maybeRelationship <- noDuplicates mkRelationshipMetadataObject -< relationshipsByName
-         (\info -> join info >- returnA) <-<
-           (| traverseA (\relationship -> do
-                info <- buildRelationship -< (foreignKeys, relationship)
-                returnA -< info <&> (, mkRelationshipMetadataObject relationship))
-           |) maybeRelationship)
-    |) (M.groupOn _crRelName relationships)
-
-  let trackedTableNames = HS.fromList $ M.keys rawTableInfo
-  computedFieldInfos <-
-    (| Inc.keyed (\_ computedFieldsByName -> do
-         maybeComputedField <- noDuplicates mkComputedFieldMetadataObject -< computedFieldsByName
-         (\info -> join info >- returnA) <-<
-           (| traverseA (\computedField -> do
-                info <- buildComputedField -< (trackedTableNames, computedField)
-                returnA -< info <&> (, mkComputedFieldMetadataObject computedField))
-           |) maybeComputedField)
-    |) (M.groupOn (_afcName . _cccComputedField) computedFields)
+     , [RemoteRelationship]
+     ) `arr` (FieldInfoMap FieldInfo, VT.TypeMap)
+addNonColumnFields = proc (rawTableInfo, columns, remoteSchemaMap, relationships, computedFields, remoteRelationships) -> do
+  relationshipInfos
+    <- buildInfoMapPreservingMetadata _crRelName mkRelationshipMetadataObject buildRelationship
+    -< (_tciForeignKeys <$> rawTableInfo, relationships)
+  computedFieldInfos
+    <- buildInfoMapPreservingMetadata
+         (_afcName . _cccComputedField)
+         mkComputedFieldMetadataObject
+         buildComputedField
+    -< (HS.fromList $ M.keys rawTableInfo, computedFields)
+  rawRemoteRelationshipInfos
+    <- buildInfoMapPreservingMetadata rtrName mkRemoteRelationshipMetadataObject buildRemoteRelationship
+    -< ((M.elems columns, remoteSchemaMap), remoteRelationships)
 
   let mapKey f = M.fromList . map (first f) . M.toList
-      relationshipFields = mapKey fromRel $ M.catMaybes relationshipInfos
-      computedFieldFields = mapKey fromComputedField $ M.catMaybes computedFieldInfos
+      relationshipFields = mapKey fromRel relationshipInfos
+      computedFieldFields = mapKey fromComputedField computedFieldInfos
+      remoteRelationshipFields = mapKey fromRemoteRelationship $
+                                 M.map (\((rf, _), mo) -> (rf, mo)) rawRemoteRelationshipInfos
+      typeMap = mconcat $ map (snd . fst) $ M.elems rawRemoteRelationshipInfos
 
   -- First, check for conflicts between non-column fields, since we can raise a better error
   -- message in terms of the two metadata objects that define them.
-  (align relationshipFields computedFieldFields >- returnA)
-    >-> (| Inc.keyed (\fieldName fields -> (fieldName, fields) >- noFieldConflicts) |)
+  fieldInfoMap <- (align relationshipFields computedFieldFields >- returnA)
+    >-> (| Inc.keyed (\fieldName fields -> (fieldName, fields) >- noFieldConflicts FIRelationship FIComputedField) |)
+    -- Second, align with remote relationship fields
+    >-> (\fields -> align (M.catMaybes fields) remoteRelationshipFields >- returnA)
+    >-> (| Inc.keyed (\fieldName fields -> (fieldName, fields) >- noFieldConflicts id FIRemoteRelationship) |)
     -- Next, check for conflicts with custom field names. This is easiest to do before merging with
     -- the column info itself because we have access to the information separately, and custom field
     -- names are not currently stored as a separate map (but maybe should be!).
@@ -71,14 +73,16 @@ addNonColumnFields = proc (rawTableInfo, columns, relationships, computedFields)
     -- Finally, check for conflicts with the columns themselves.
     >-> (\fields -> align columns (M.catMaybes fields) >- returnA)
     >-> (| Inc.keyed (\_ fields -> fields >- noColumnConflicts) |)
+
+  returnA -< (fieldInfoMap, typeMap)
   where
-    noFieldConflicts = proc (fieldName, fields) -> case fields of
-      This (relationship, metadata) -> returnA -< Just (FIRelationship relationship, metadata)
-      That (computedField, metadata) -> returnA -< Just (FIComputedField computedField, metadata)
-      These (_, relationshipMetadata) (_, computedFieldMetadata) -> do
+    noFieldConflicts this that = proc (fieldName, fields) -> case fields of
+      This (thisField, metadata) -> returnA -< Just (this thisField, metadata)
+      That (thatField, metadata) -> returnA -< Just (that thatField, metadata)
+      These (_, thisMetadata) (_, thatMetadata) -> do
         tellA -< Seq.singleton $ CIInconsistency $ ConflictingObjects
           ("conflicting definitions for field " <>> fieldName)
-          [relationshipMetadata, computedFieldMetadata]
+          [thisMetadata, thatMetadata]
         returnA -< Nothing
 
     noCustomFieldConflicts = proc (columns, nonColumnFields) -> do
@@ -155,3 +159,26 @@ buildComputedField = proc (trackedTableNames, computedField) -> do
           bindErrorA -< addComputedFieldP2Setup trackedTableNames qt name def rawfi comment)
      |) (addTableContext qt . addComputedFieldContext))
    |) (mkComputedFieldMetadataObject computedField)
+
+mkRemoteRelationshipMetadataObject :: RemoteRelationship -> MetadataObject
+mkRemoteRelationshipMetadataObject rr =
+  let objectId = MOTableObj (rtrTable rr) $ MTORemoteRelationship $ rtrName rr
+  in MetadataObject objectId $ toJSON rr
+
+buildRemoteRelationship
+  :: ( ArrowChoice arr, ArrowWriter (Seq CollectedInfo) arr
+     , ArrowKleisli m arr, MonadError QErr m )
+  => (([PGColumnInfo], RemoteSchemaMap), RemoteRelationship) `arr` Maybe (RemoteFieldInfo, VT.TypeMap)
+buildRemoteRelationship = proc ((pgColumns, remoteSchemaMap), remoteRelationship) -> do
+  let relationshipName = rtrName remoteRelationship
+      tableName = rtrTable remoteRelationship
+      metadataObject = mkRemoteRelationshipMetadataObject remoteRelationship
+      schemaObj = SOTableObj (rtrTable remoteRelationship) $ TORemoteRel relationshipName
+      addRemoteRelationshipContext e = "in remote relationship" <> relationshipName <<> ": " <> e
+  (| withRecordInconsistency (
+       (| modifyErrA (do
+          (remoteField, typeMap, dependencies) <- bindErrorA -< resolveRemoteRelationship remoteRelationship pgColumns remoteSchemaMap
+          recordDependencies -< (metadataObject, schemaObj, dependencies)
+          returnA -< (remoteField, typeMap))
+        |)(addTableContext tableName . addRemoteRelationshipContext))
+   |) metadataObject

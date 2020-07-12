@@ -4,7 +4,7 @@ module Hasura.RQL.DML.Delete
   , AnnDelG(..)
   , traverseAnnDel
   , AnnDel
-  , deleteQueryToTx
+  , execDeleteQuery
   , runDelete
   ) where
 
@@ -20,6 +20,7 @@ import           Hasura.RQL.DML.Mutation
 import           Hasura.RQL.DML.Returning
 import           Hasura.RQL.GBoolExp
 import           Hasura.RQL.Types
+import           Hasura.Server.Version    (HasVersion)
 import           Hasura.SQL.Types
 
 import qualified Database.PG.Query        as Q
@@ -29,7 +30,7 @@ data AnnDelG v
   = AnnDel
   { dqp1Table   :: !QualifiedTable
   , dqp1Where   :: !(AnnBoolExp v, AnnBoolExp v)
-  , dqp1MutFlds :: !(MutFldsG v)
+  , dqp1Output  :: !(MutationOutputG v)
   , dqp1AllCols :: ![PGColumnInfo]
   } deriving (Show, Eq)
 
@@ -41,10 +42,10 @@ traverseAnnDel
 traverseAnnDel f annUpd =
   AnnDel tn
   <$> ((,) <$> traverseAnnBoolExp f whr <*> traverseAnnBoolExp f fltr)
-  <*> traverseMutFlds f mutFlds
+  <*> traverseMutationOutput f mutOutput
   <*> pure allCols
   where
-    AnnDel tn (whr, fltr) mutFlds allCols = annUpd
+    AnnDel tn (whr, fltr) mutOutput allCols = annUpd
 
 type AnnDel = AnnDelG S.SQLExp
 
@@ -112,16 +113,23 @@ validateDeleteQ
 validateDeleteQ =
   runDMLP1T . validateDeleteQWith sessVarFromCurrentSetting binRHSBuilder
 
-deleteQueryToTx :: Bool -> (AnnDel, DS.Seq Q.PrepArg) -> Q.TxE QErr EncJSON
-deleteQueryToTx strfyNum (u, p) =
-  runMutation $ Mutation (dqp1Table u) (deleteCTE, p)
-                (dqp1MutFlds u) (dqp1AllCols u) strfyNum
+execDeleteQuery
+  :: (HasVersion, MonadTx m, MonadIO m)
+  => Bool
+  -> Maybe MutationRemoteJoinCtx
+  -> (AnnDel, DS.Seq Q.PrepArg)
+  -> m EncJSON
+execDeleteQuery strfyNum remoteJoinCtx (u, p) =
+  runMutation $ mkMutation remoteJoinCtx (dqp1Table u) (deleteCTE, p)
+                (dqp1Output u) (dqp1AllCols u) strfyNum
   where
     deleteCTE = mkDeleteCTE u
 
 runDelete
-  :: (QErrM m, UserInfoM m, CacheRM m, MonadTx m, HasSQLGenCtx m)
+  :: ( HasVersion, QErrM m, UserInfoM m, CacheRM m
+     , MonadTx m, HasSQLGenCtx m, MonadIO m
+     )
   => DeleteQuery -> m EncJSON
 runDelete q = do
   strfyNum <- stringifyNum <$> askSQLGenCtx
-  validateDeleteQ q >>= liftTx . deleteQueryToTx strfyNum
+  validateDeleteQ q >>= execDeleteQuery strfyNum Nothing

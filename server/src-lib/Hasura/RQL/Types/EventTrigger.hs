@@ -18,6 +18,7 @@ module Hasura.RQL.Types.EventTrigger
   , EventHeaderInfo(..)
   , WebhookConf(..)
   , WebhookConfInfo(..)
+  , HeaderConf(..)
 
   , defaultRetryConf
   , defaultTimeoutSeconds
@@ -38,6 +39,7 @@ import qualified Data.Text                  as T
 import qualified Database.PG.Query          as Q
 import qualified Text.Regex.TDFA            as TDFA
 
+-- | Unique name for event trigger.
 newtype TriggerName = TriggerName { unTriggerName :: NonEmptyText }
   deriving (Show, Eq, Hashable, Lift, DQuote, FromJSON, ToJSON, ToJSONKey, Q.FromCol, Q.ToPrepArg, Generic, Arbitrary, NFData, Cacheable)
 
@@ -105,10 +107,16 @@ $(deriveToJSON (aesonDrop 3 snakeCase){omitNothingFields=True} ''EventHeaderInfo
 data WebhookConf = WCValue T.Text | WCEnv T.Text
   deriving (Show, Eq, Generic, Lift)
 instance NFData WebhookConf
+instance Cacheable WebhookConf
 
 instance ToJSON WebhookConf where
   toJSON (WCValue w)  = String w
-  toJSON (WCEnv wEnv) = String wEnv
+  toJSON (WCEnv wEnv) = object ["from_env" .= wEnv ]
+
+instance FromJSON WebhookConf where
+  parseJSON (Object o) = WCEnv <$> o .: "from_env"
+  parseJSON (String t) = pure $ WCValue t
+  parseJSON _          = fail "one of string or object must be provided for webhook"
 
 data WebhookConfInfo
   = WebhookConfInfo
@@ -172,6 +180,7 @@ instance FromJSON CreateEventTriggerQuery where
 
 $(deriveToJSON (aesonDrop 4 snakeCase){omitNothingFields=True} ''CreateEventTriggerQuery)
 
+-- | The table operations on which the event trigger will be invoked.
 data TriggerOpsDef
   = TriggerOpsDef
   { tdInsert       :: !(Maybe SubscribeOpSpec)

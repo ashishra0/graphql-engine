@@ -1,6 +1,6 @@
-.. .. meta::
-   :description: Installing the hasura CLI on Linux, Mac OS, Windows.
-   :keywords: hasura, hasura CLI, install, linux, mac, windows
+.. meta::
+   :description: Install the Hasura CLI on Linux, Mac OS, Windows
+   :keywords: hasura, hasura cli, install, linux, mac, windows
 
 .. _install_hasura_cli:
 
@@ -25,7 +25,7 @@ Install a binary globally
 
          .. code-block:: bash
 
-            curl -L https://github.com/hasura/graphql-engine/raw/master/cli/get.sh | bash
+            curl -L https://github.com/hasura/graphql-engine/raw/stable/cli/get.sh | bash
 
          This will install the Hasura CLI in ``/usr/local/bin``. You might have to provide
          your ``sudo`` password depending on the permissions of your ``/usr/local/bin`` location.
@@ -35,7 +35,7 @@ Install a binary globally
 
          .. code-block:: bash
 
-            curl -L https://github.com/hasura/graphql-engine/raw/master/cli/get.sh | INSTALL_PATH=$HOME/bin bash
+            curl -L https://github.com/hasura/graphql-engine/raw/stable/cli/get.sh | INSTALL_PATH=$HOME/bin bash
 
 
 
@@ -45,7 +45,7 @@ Install a binary globally
 
          .. code-block:: bash
 
-            curl -L https://github.com/hasura/graphql-engine/raw/master/cli/get.sh | bash
+            curl -L https://github.com/hasura/graphql-engine/raw/stable/cli/get.sh | bash
 
          This will install the Hasura CLI in ``/usr/local/bin``. You might have to provide
          your ``sudo`` password depending on the permissions of your ``/usr/local/bin`` location.
@@ -55,7 +55,7 @@ Install a binary globally
 
          .. code-block:: bash
 
-            curl -L https://github.com/hasura/graphql-engine/raw/master/cli/get.sh | INSTALL_PATH=$HOME/bin bash
+            curl -L https://github.com/hasura/graphql-engine/raw/stable/cli/get.sh | INSTALL_PATH=$HOME/bin bash
 
      - id: windows
        content: |
@@ -70,16 +70,16 @@ Install through npm
 -------------------
 
 Hasura CLI is available as an npm package that is independently maintained by some members of the community.
-It can be beneficial to use the npm package if you want a version-fixed cli dedicated to your node project.
-You can find usage details in  the `original repository <https://github.com/jjangga0214/hasura-cli>`_.
+It can be beneficial to use the npm package if you want a version-fixed cli dedicated to your node.js project.
+You can find usage details (e.g. flag information) in  the `original repository <https://github.com/jjangga0214/hasura-cli>`__.
 
 .. code-block:: bash
    
    # install as a devDependency of your project
-   npm install --save-dev hasura-cli
+   npm install --save-dev hasura-cli[@tag|@version]
    
    # or install globally on your system
-   npm install --global hasura-cli
+   npm install --global hasura-cli[@tag|@version]
 
 (Optional) Add shell completion
 -------------------------------

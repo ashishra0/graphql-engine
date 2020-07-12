@@ -1,3 +1,9 @@
+.. meta::
+   :description: Hasura GraphQL API reference
+   :keywords: hasura, docs, GraphQL API, reference
+
+.. _api_reference_graphql:
+
 GraphQL API Reference
 =====================
 
@@ -25,13 +31,13 @@ Request types
 
 The following types of requests can be made using the GraphQL API:
 
-- :doc:`Query / Subscription <query>`
-- :doc:`Mutation <mutation>`
+- :ref:`Query / Subscription <graphql_api_query>`
+- :ref:`Mutation <graphql_api_mutation>`
 
-Batching operations
--------------------
+Batching requests
+-----------------
 
-The GraphQL API provides support for batched operations (which can be a combination of queries and mutations).
+The GraphQL API provides support for batched requests (which can be a combination of queries and mutations).
 The endpoint will accept an array of operations in place of a single operation, and return an array of corresponding 
 responses.
 
@@ -84,4 +90,3 @@ query operations in one request:
 
   Query / Subscription <query>
   Mutation <mutation>
-  Batching operations <batching>

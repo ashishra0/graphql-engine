@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import pytest
 import ruamel.yaml as yaml
 from ruamel.yaml.compat import ordereddict, StringIO
 from ruamel.yaml.comments import CommentedMap
@@ -9,12 +8,12 @@ import copy
 import graphql
 import os
 import base64
-import json
 import jsondiff
 import jwt
+import queue
 import random
-import time
 import warnings
+import pytest
 
 from context import GQLWsClient, PytestConf
 
@@ -66,7 +65,7 @@ def check_event(hge_ctx, evts_webhook, trig_name, table, operation, exp_ev_data,
 
 
 def test_forbidden_when_admin_secret_reqd(hge_ctx, conf):
-    if conf['url'] == '/v1/graphql':
+    if conf['url'] == '/v1/graphql' or conf['url'] == '/v1beta1/relay':
         if conf['status'] == 404:
             status = [404]
         else:
@@ -105,7 +104,7 @@ def test_forbidden_when_admin_secret_reqd(hge_ctx, conf):
 
 
 def test_forbidden_webhook(hge_ctx, conf):
-    if conf['url'] == '/v1/graphql':
+    if conf['url'] == '/v1/graphql' or conf['url'] == '/v1beta1/relay':
         if conf['status'] == 404:
             status = [404]
         else:
@@ -125,10 +124,27 @@ def test_forbidden_webhook(hge_ctx, conf):
         'request id': resp_hdrs.get('x-request-id')
     })
 
+def mk_claims_with_namespace_path(claims,hasura_claims,namespace_path):
+    if namespace_path is None:
+        claims['https://hasura.io/jwt/claims'] = hasura_claims
+    elif namespace_path == "$":
+        claims.update(hasura_claims)
+    elif namespace_path == "$.hasura_claims":
+        claims['hasura_claims'] = hasura_claims
+    elif namespace_path == "$.hasura['claims%']":
+        claims['hasura'] = {}
+        claims['hasura']['claims%'] = hasura_claims
+    else:
+        raise Exception(
+                '''claims_namespace_path should not be anything
+                other than $.hasura_claims, $.hasura['claims%'] or $ for testing. The
+                value of claims_namespace_path was {}'''.format(namespace_path))
+    return claims
 
 # Returns the response received and a bool indicating whether the test passed
 # or not (this will always be True unless we are `--accepting`)
-def check_query(hge_ctx, conf, transport='http', add_auth=True):
+def check_query(hge_ctx, conf, transport='http', add_auth=True, claims_namespace_path=None):
+    hge_ctx.tests_passed = True
     headers = {}
     if 'headers' in conf:
         headers = conf['headers']
@@ -152,8 +168,8 @@ def check_query(hge_ctx, conf, transport='http', add_auth=True):
             claim = {
                 "sub": "foo",
                 "name": "bar",
-                "https://hasura.io/jwt/claims": hClaims
             }
+            claim = mk_claims_with_namespace_path(claim,hClaims,claims_namespace_path)
             headers['Authorization'] = 'Bearer ' + jwt.encode(claim, hge_ctx.hge_jwt_key, algorithm='RS512').decode(
                 'UTF-8')
 
@@ -180,36 +196,45 @@ def check_query(hge_ctx, conf, transport='http', add_auth=True):
             test_forbidden_when_admin_secret_reqd(hge_ctx, conf)
             headers['X-Hasura-Admin-Secret'] = hge_ctx.hge_key
 
-    assert transport in ['websocket', 'http'], "Unknown transport type " + transport
-    if transport == 'websocket':
-        assert 'response' in conf
-        assert conf['url'].endswith('/graphql')
-        print('running on websocket')
-        return validate_gql_ws_q(
-            hge_ctx,
-            conf['url'],
-            conf['query'],
-            headers,
-            conf['response'],
-            True
-        )
-    elif transport == 'http':
+    assert transport in ['http', 'websocket', 'subscription'], "Unknown transport type " + transport
+    if transport == 'http':
         print('running on http')
         return validate_http_anyq(hge_ctx, conf['url'], conf['query'], headers,
                                   conf['status'], conf.get('response'))
+    elif transport == 'websocket':
+        print('running on websocket')
+        return validate_gql_ws_q(hge_ctx, conf, headers, retry=True)
+    elif transport == 'subscription':
+        print('running via subscription')
+        return validate_gql_ws_q(hge_ctx, conf, headers, retry=True, via_subscription=True)
 
 
+def validate_gql_ws_q(hge_ctx, conf, headers, retry=False, via_subscription=False):
+    assert 'response' in conf
+    assert conf['url'].endswith('/graphql') or conf['url'].endswith('/relay')
+    endpoint = conf['url']
+    query = conf['query']
+    exp_http_response = conf['response']
 
-def validate_gql_ws_q(hge_ctx, endpoint, query, headers, exp_http_response, retry=False):
+    if via_subscription:
+        query_text = query['query']
+        assert query_text.startswith('query '), query_text
+        # make the query into a subscription and add the
+        # _multiple_subscriptions directive that enables having more
+        # than 1 root field in a subscription
+        query['query'] = 'subscription' + query_text[len('query'):].replace("{"," @_multiple_top_level_fields {",1)
+
     if endpoint == '/v1alpha1/graphql':
         ws_client = GQLWsClient(hge_ctx, '/v1alpha1/graphql')
+    elif endpoint == '/v1beta1/relay':
+        ws_client = GQLWsClient(hge_ctx, '/v1beta1/relay')
     else:
         ws_client = hge_ctx.ws_client
     print(ws_client.ws_url)
     if not headers or len(headers) == 0:
         ws_client.init({})
 
-    query_resp = ws_client.send_query(query, headers=headers, timeout=15)
+    query_resp = ws_client.send_query(query, query_id='hge_test', headers=headers, timeout=15)
     resp = next(query_resp)
     print('websocket resp: ', resp)
 
@@ -226,12 +251,17 @@ def validate_gql_ws_q(hge_ctx, endpoint, query, headers, exp_http_response, retr
         assert resp['type'] in ['data', 'error'], resp
     else:
         assert resp['type'] == 'data', resp
-
     assert 'payload' in resp, resp
-    resp_done = next(query_resp)
-    assert resp_done['type'] == 'complete'
 
-    return assert_graphql_resp_expected(resp['payload'], exp_http_response, query)
+    if via_subscription:
+        ws_client.send({ 'id': 'hge_test', 'type': 'stop' })
+        with pytest.raises(queue.Empty):
+            ws_client.get_ws_event(0)
+    else:
+        resp_done = next(query_resp)
+        assert resp_done['type'] == 'complete'
+
+    return assert_graphql_resp_expected(resp['payload'], exp_http_response, query, skip_if_err_msg=hge_ctx.avoid_err_msg_checks)
 
 
 def validate_http_anyq(hge_ctx, url, query, headers, exp_code, exp_response):
@@ -240,7 +270,7 @@ def validate_http_anyq(hge_ctx, url, query, headers, exp_code, exp_response):
     assert code == exp_code, resp
     print('http resp: ', resp)
     if exp_response:
-        return assert_graphql_resp_expected(resp, exp_response, query, resp_hdrs)
+        return assert_graphql_resp_expected(resp, exp_response, query, resp_hdrs, hge_ctx.avoid_err_msg_checks)
     else:
         return resp, True
 
@@ -250,7 +280,7 @@ def validate_http_anyq(hge_ctx, url, query, headers, exp_code, exp_response):
 #
 # Returns 'resp' and a bool indicating whether the test passed or not (this
 # will always be True unless we are `--accepting`)
-def assert_graphql_resp_expected(resp_orig, exp_response_orig, query, resp_hdrs={}):
+def assert_graphql_resp_expected(resp_orig, exp_response_orig, query, resp_hdrs={}, skip_if_err_msg=False):
     # Prepare actual and respected responses so comparison takes into
     # consideration only the ordering that we care about:
     resp         = collapse_order_not_selset(resp_orig,         query)
@@ -270,12 +300,30 @@ def assert_graphql_resp_expected(resp_orig, exp_response_orig, query, resp_hdrs=
             'diff':
               (lambda diff:
                  "(results differ only in their order of keys)" if diff == {} else diff)
-              (stringify_keys(jsondiff.diff(exp_response, resp)))
+              (stringify_keys(jsondiff.diff(exp_response, resp))),
+              'query': query
         }
         if 'x-request-id' in resp_hdrs:
             test_output['request id'] = resp_hdrs['x-request-id']
         yml.dump(test_output, stream=dump_str)
-        assert matched, '\n' + dump_str.getvalue()
+        if not skip_if_err_msg:
+            assert matched, '\n' + dump_str.getvalue()
+        elif matched:
+            return resp, matched
+        else:
+            def is_err_msg(msg):
+                return any(msg.get(x) for x in ['error','errors'])
+            def as_list(x):
+                return x if isinstance(x, list) else [x]
+            # If it is a batch GraphQL query, compare each individual response separately
+            for (exp, out) in zip(as_list(exp_response), as_list(resp)):
+                matched_ = equal_CommentedMap(exp, out)
+                if is_err_msg(exp):
+                    if not matched_:
+                        warnings.warn("Response does not have the expected error message\n" + dump_str.getvalue())
+                        return resp, matched
+                else:
+                    assert matched_, '\n' + dump_str.getvalue()
     return resp, matched  # matched always True unless --accept
 
 # This really sucks; newer ruamel made __eq__ ignore ordering:
@@ -298,6 +346,11 @@ def equal_CommentedMap(m1, m2):
     # else this is a scalar:
     else:
         return m1 == m2
+
+# Parse test case YAML file
+def get_conf_f(f):
+    with open(f, 'r+') as c:
+        return yaml.YAML().load(c)
 
 def check_query_f(hge_ctx, f, transport='http', add_auth=True):
     print("Test file: " + f)
@@ -390,26 +443,15 @@ def collapse_order_not_selset(result_inp, query):
 
 # Use this since jsondiff seems to produce object/dict structures that can't
 # always be serialized to json.
-# Copy-pasta from: https://stackoverflow.com/q/12734517/176841
 def stringify_keys(d):
- """Convert a dict's keys to strings if they are not."""
- if isinstance(d, dict):
-   for key in d.keys():
-     # check inner dict
-     if isinstance(d[key], dict):
-         value = stringify_keys(d[key])
-     else:
-         value = d[key]
-     # convert nonstring to string if needed
-     if not isinstance(key, str):
-         try:
-             d[key.decode("utf-8")] = value
-         except Exception:
-             try:
-                 d[repr(key)] = value
-             except Exception:
-                 raise
+    """Recursively convert a dict's keys to strings."""
+    if not isinstance(d, dict): return d
 
-         # delete old key
-         del d[key]
- return d
+    def decode(k):
+        if isinstance(k, str): return k
+        try:
+            return k.decode("utf-8")
+        except Exception:
+            return repr(k)
+
+    return { decode(k): stringify_keys(v) for k, v in d.items() }

@@ -1,3 +1,9 @@
+.. meta::
+   :description: Manage subscriptions with Hasura
+   :keywords: hasura, docs, subscription
+
+.. _subscriptions:
+
 Subscriptions
 =============
 
@@ -13,7 +19,7 @@ A GraphQL subscription is essentially a query where the client receives an updat
 changes upstream.
 
 Subscriptions are supported for all kinds of queries. All the concepts of
-:doc:`queries <../queries/index>` hold true for subscriptions as well.
+:ref:`queries <queries>` hold true for subscriptions as well.
 
 Execution
 ---------
@@ -24,9 +30,9 @@ latest result of the query being made and not necessarily all the individual eve
 By default updates are delivered to clients every **1 sec**. This interval can be configured via the
 ``HASURA_GRAPHQL_LIVE_QUERIES_MULTIPLEXED_REFETCH_INTERVAL`` env var or the
 ``--live-queries-multiplexed-refetch-interval`` flag. See the
-:doc:`server flag reference <../deployment/graphql-engine-flags/reference>` for info on setting the flag/env var.
+:ref:`server flag reference <server_flag_reference>` for info on setting the flag/env var.
 
-You can read more about the implementation of subscriptions in the `architecture doc <https://github.com/hasura/graphql-engine/blob/master/architecture/live-queries.md>`_.
+You can read more about the implementation of subscriptions in the `architecture doc <https://github.com/hasura/graphql-engine/blob/master/architecture/live-queries.md>`__.
 
 Convert a query to a subscription
 ---------------------------------
@@ -35,7 +41,7 @@ You can turn any query into a subscription by simply replacing ``query`` with ``
 
 .. admonition:: Caveat
 
-  Hasura follows the `GraphQL spec <https://graphql.github.io/graphql-spec/June2018/#sec-Single-root-field>`_ which
+  Hasura follows the `GraphQL spec <https://graphql.github.io/graphql-spec/June2018/#sec-Single-root-field>`__ which
   allows for only one root field in a subscription.
 
 Use cases
@@ -49,8 +55,8 @@ Communication protocol
 ----------------------
 
 Hasura GraphQL engine uses the `GraphQL over WebSocket Protocol
-<https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md>`_ by the
-`apollographql/subscriptions-transport-ws <https://github.com/apollographql/subscriptions-transport-ws>`_ library
+<https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md>`__ by the
+`apollographql/subscriptions-transport-ws <https://github.com/apollographql/subscriptions-transport-ws>`__ library
 for sending and receiving events.
 
 .. admonition:: Setting headers for subscriptions with Apollo client
@@ -72,7 +78,7 @@ for sending and receiving events.
       }
     });
 
-  See `this <https://www.apollographql.com/docs/react/data/subscriptions/#authentication-over-websocket>`_ for more
+  See `this <https://www.apollographql.com/docs/react/data/subscriptions/#authentication-over-websocket>`__ for more
   info on using ``connectionParams``.
 
 
@@ -101,7 +107,7 @@ It uses the provided CORS configuration (as per :ref:`configure-cors`).
    (because of potential security issues). To override the behaviour, you can
    use the flag ``--ws-read-cookie`` or the environment variable
    ``HASURA_GRAPHQL_WS_READ_COOKIE``. See
-   :doc:`../deployment/graphql-engine-flags/reference` for the setting.
+   :ref:`server_flag_reference` for the setting.
 
 .. toctree::
   :maxdepth: 1

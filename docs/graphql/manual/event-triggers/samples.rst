@@ -1,3 +1,9 @@
+.. meta::
+   :description: Examples for event triggers with Hasura
+   :keywords: hasura, docs, event trigger, example
+
+.. _trigger_samples:
+
 Event trigger samples
 =====================
 
@@ -25,7 +31,7 @@ Makes a mutation based on the event payload. It helps in understanding database 
 Push Notifications
 ^^^^^^^^^^^^^^^^^^
 
-Here's a `notification demo app <https://serverless-push.demo.hasura.app/>`_ showcasing sending web
+Here's a `notification demo app <https://serverless-push.demo.hasura.app/>`__ showcasing sending web
 notifications using Hasura event triggers and FCM.
 
 * Video: https://www.youtube.com/watch?v=nuSHkzE2-zo&feature=youtu.be
@@ -33,7 +39,7 @@ notifications using Hasura event triggers and FCM.
 
 Data Transformations (ETL)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
-Here's a `serverless ETL demo app <https://serverless-etl.demo.hasura.app/>`_ built using Hasura event triggers and
+Here's a `serverless ETL demo app <https://serverless-etl.demo.hasura.app/>`__ built using Hasura event triggers and
 Algolia search.
 
 * Video: https://youtu.be/kWVEBWdEVAA
